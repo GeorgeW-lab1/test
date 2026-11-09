@@ -791,7 +791,7 @@ def benchmark(
     print(f"Expected hashes per successful search: {2**bits:,}")
     print(f"Trials per strategy: {trials}")
 
-    print("\n{:<24s} {:>14s} {:>12s} {:>14s}".format(
+    print("\n{:<12s} {:>14s} {:>12s} {:>14s}".format(
         "Strategy",
         "Mean hashes",
         "Mean time",
@@ -841,7 +841,7 @@ def benchmark(
         best_rate = max(best_rate, rate)
 
         print(
-            f"{name:<24s} "
+            f"{name:<12s} "
             f"{statistics.mean(hash_counts):>14,.0f} "
             f"{statistics.mean(durations):>11.3f}s "
             f"{rate:>14,.0f}"
@@ -870,7 +870,7 @@ def benchmark(
     if best_rate > 0:
         print("\nProjected search times at measured best rate:")
 
-        for b in (20, 24, 28, 32, 40, 48):
+        for b in (20, 12, 28, 32, 40, 48):
 
             expected = 2**b
 
@@ -1156,7 +1156,7 @@ def main():
     parser.add_argument(
         "--bits",
         type=int,
-        default=24,
+        default=12,
         help="Local proof-of-work difficulty in bits"
     )
 
@@ -1210,7 +1210,7 @@ def main():
     parser.add_argument(
         "--bench-bits",
         type=int,
-        default=24
+        default=12
     )
 
     parser.add_argument(
@@ -1227,7 +1227,7 @@ def main():
     parser.add_argument(
         "--nonce-bits",
         type=int,
-        default=24
+        default=12
     )
 
     args = parser.parse_args()
