@@ -933,11 +933,6 @@ def build_response(header: str, nonce: int, message: int, msg_bits: int = HASH_B
     return DELIM.join((h, n, m, pad_hex(d, DIGEST_HEX)))
 
 
-def digest_zero_bits(d_field: str) -> int:
-    """Leading zero bits of the 256-bit digest inside the 512-bit padded field."""
-    return 256 - int(d_field, 16).bit_length()
-
-
 def verify_response(resp: str) -> bool:
     """Recompute the sha256 field from header, nonce and message."""
     try:
@@ -948,6 +943,13 @@ def verify_response(resp: str) -> bool:
     if len(n) != NONCE_HEX or len(d) != DIGEST_HEX or int(d, 16) >> 256:
         return False
     return pad_hex(int.from_bytes(digest_text(h, n, m), "big"), DIGEST_HEX) == d
+
+
+def digest_zero_bits(d_field: str) -> int:
+    """Leading zero bits of the 256-bit digest inside the 512-bit padded field."""
+    return 256 - int(d_field, 16).bit_length()
+
+
 
 
 # ------------------------------------------------------------------ latch registers + async workers
