@@ -75,6 +75,36 @@ except ImportError:
 # ============================================================
 # CONFIGURATION / VALIDATION
 # ============================================================
+def reconstruct_oracle_sha256(seed):
+    """
+    Reconstruct the deterministic SHA-256 output
+    from the original 64-bit oracle value.
+    """
+
+    if not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("Oracle seed must be 64 bits.")
+
+    oracle_input = seed.to_bytes(8, "big")
+
+    oracle_sha256 = hashlib.sha256(
+        oracle_input
+    ).digest()
+
+    extranonce2 = oracle_sha256[:4]
+
+    return {
+        "oracle_input": oracle_input,
+        "oracle_sha256": oracle_sha256,
+        "extranonce2": extranonce2
+    }
+
+
+def verify_oracle_reconstruction(seed, expected_digest):
+    reconstructed = reconstruct_oracle_sha256(seed)
+
+    return (
+        reconstructed["oracle_sha256"] == expected_digest
+    )
 
 def validate_bits(bits):
     if not 1 <= bits <= 255:
@@ -1126,7 +1156,7 @@ def main():
     parser.add_argument(
         "--bits",
         type=int,
-        default=20,
+        default=24,
         help="Local proof-of-work difficulty in bits"
     )
 
@@ -1180,7 +1210,7 @@ def main():
     parser.add_argument(
         "--bench-bits",
         type=int,
-        default=18
+        default=24
     )
 
     parser.add_argument(
@@ -1197,7 +1227,7 @@ def main():
     parser.add_argument(
         "--nonce-bits",
         type=int,
-        default=20
+        default=24
     )
 
     args = parser.parse_args()
@@ -1314,16 +1344,25 @@ def main():
 
             seed = oracle.oracle_64()
 
-            print(
-                f"[oracle] 64-bit input: {seed:016x}"
-            )
+            print(f"[oracle] 64-bit input: {seed:016x}")
 
-            extranonce2 = oracle_to_extranonce2(seed)
+            reconstruction = reconstruct_oracle_sha256(seed)
 
-            print(
-                f"[oracle] extranonce2: {extranonce2.hex()}"
-            )
+            oracle_input = reconstruction["oracle_input"]
+            oracle_digest = reconstruction["oracle_sha256"]
+            extranonce2 = reconstruction["extranonce2"]
 
+            print(f"[oracle] input bytes : {oracle_input.hex()}")
+            print(f"[oracle] SHA-256     : {oracle_digest.hex()}")
+            print(f"[oracle] extranonce2: {extranonce2.hex()}")
+
+            # Independently reconstruct the oracle SHA-256.
+            reconstructed = hashlib.sha256(oracle_input).digest()
+
+            if reconstructed != oracle_digest:
+                raise RuntimeError("[oracle] SHA-256 reconstruction failed")
+
+            print("[oracle] SHA-256 reconstruction: PASS")
             # ------------------------------------------------
             # HEADER CONSTRUCTION
             # ------------------------------------------------
@@ -1333,7 +1372,7 @@ def main():
             )
 
             print(
-                f"[miner] header prefix: {len(prefix)} bytes"
+                f"[miner] header prefix: {prefix.hex()} {len(prefix)} bytes"
             )
 
             print(
