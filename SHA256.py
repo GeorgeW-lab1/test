@@ -71,27 +71,37 @@ secret). After EVERY spot check, hit or miss, a new secret is hidden. Expected h
 hits and luck factor. The luck factor is hits / expected hits in percent (100% = average),
 shown with P(>= hits by chance), the binomial tail probability.
 
-Hash prediction + response latch (the higher/lower search above, now aimed at a hash):
-the secret is a 512-bit SHA-512 digest (default). The pooled higher/lower search predicts it one
-bit per armed frame, MSB first, and the single final check verifies the whole 512-bit prediction.
-Only that verified solve opens the RESPONSE LATCH (a D latch clocked on the frame edge). The latch
-captures and HOLDS one delivery string, never the bare hash:
+Hash prediction -> response latch -> PoW miners (three independent async workers):
+the higher/lower search is aimed at a 512-bit SHA-512 digest. Nothing in this chain waits on,
+joins or is called by another stage; every worker is its own thread running its own asyncio
+loop, and stages only touch each other through LATCH REGISTERS (a value plus a sequence number,
+lock held for a pointer swap only, so a read or write never blocks on a slow peer):
 
-    <padded nonce>:<padded message>:<padded sha256>
+    camera loop --pulse--> [tick box] --> ORACLE worker --write--> [message latch]
+    [message latch] + [config latch] --read--> MINER lanes (N threads) --write--> [response latch]
+    GUI --reads all latches on a timer, writes the config latch (header, difficulty)
 
-  nonce    256-bit SHA-256 of that frame's motion pattern, zero-padded to 64 hex chars
-  message  the predicted 512-bit hash, zero-padded to 128 hex chars
-  sha256   SHA-256 over the ASCII text "<padded nonce>:<padded message>", zero-padded to 64 hex
-The field delimiter is ":". The latch keeps its value until the next verified solve or Clear;
-Copy and Verify buttons read it without clearing it.
+  * The camera loop only appends a tick (bounded deque, drops oldest, never blocks) on every armed
+    frame and later collects finished oracle hits. It never calls the search itself.
+  * The oracle worker pools one bit per tick; the final check passing writes the verified 512-bit
+    hash into the message latch and goes on. It does not know the miners exist.
+  * Each miner lane reads whatever is in the message latch and config latch, picks its own random
+    nonce start and hashes. It abandons a job only because a latch it READ has changed or holds a
+    solution for that job; no lane signals another. The lane that wins publishes once.
+  * With no miner running the message latch simply holds; with no oracle result the miners idle.
 
-PoW miner (own thread, Start/Stop button in the latch box): the latch first GATHERS the oracle's
-verified 512-bit prediction as its message register. While the miner runs, the miner thread then
-searches a 256-bit nonce so that SHA-256("<padded nonce>:<padded message>") has at least the set
-number of leading zero bits, and only that nonce/digest pair completes the latch. With the miner
-stopped, the latch completes at once using the frame's motion hash as nonce (no work proof).
-A single Python thread is used: hashlib holds the GIL on short inputs, so more threads would not
-add hash rate.
+Response string (delimiter ":"), the latch holds this and never the bare hash:
+
+    <header>:<padded nonce>:<padded message>:<padded sha256>
+
+  header   custom text you set in the GUI (ASCII, no ":", up to 32 chars)
+  nonce    256-bit field (64 hex), found by the miners
+  message  the predicted 512-bit hash, 128 hex
+  sha256   SHA-256 over the ASCII text "<header>:<nonce>:<message>", shown as a 512-bit zero-padded
+           hex field (128 hex chars; the top 256 bits are always zero)
+PoW difficulty counts leading zero bits of the 256-bit digest itself, not of the padded field.
+Hashing is pure Python (hashlib holds the GIL on short inputs), so extra lanes add concurrency, not
+much hash rate.
 
 Factoriser (separate source, own panel): N is factored through the same higher/lower bit search.
 The oracle holds the smallest prime factor p of N and answers only "p >= trial?". Each armed frame
@@ -862,7 +872,7 @@ SEARCH_BITS_MAX = 4096
 def short_int(n: int, keep: int = 20) -> str:
     """Hex form of a big integer, shortened to its first and last digits."""
     h = format(n, "x")
-    return h if len(h) <= 2 * keep + 3 else f"{h[:keep]}...{h[-keep:]} ({len(h) * 4} bit hex)"
+    return h if len(h) <= 2 * keep + 3 else f"{h}...{h} ({len(h) * 4} bit hex)"
 
 
 def hash_secret(bits: int) -> int:
@@ -876,10 +886,22 @@ def hash_secret(bits: int) -> int:
     return int.from_bytes(out, "big") >> (len(out) * 8 - bits)
 
 
-# ------------------------------------------------------------------ padded response + latch
-NONCE_HEX = 64                      # 256-bit nonce
-DIGEST_HEX = 64                     # SHA-256 output
+# ------------------------------------------------------------------ padded response format
+HEADER_DEFAULT = "RPCAM1"
+HEADER_MAX = 32
+NONCE_HEX = 64                      # 256-bit nonce field
+DIGEST_HEX = 128                    # sha256 shown as a 512-bit padded field
 DELIM = ":"
+MINER_DIFF_DEFAULT = 20             # leading zero bits of the 256-bit digest
+MINER_DIFF_MAX = 40
+MINER_LANES_DEFAULT = 2
+MINER_LANES_MAX = 16
+
+
+def sanitize_header(text: str) -> str:
+    """ASCII printable, no delimiter, no spaces, at most HEADER_MAX chars."""
+    h = "".join(c for c in str(text) if 33 <= ord(c) < 127 and c != DELIM)[:HEADER_MAX]
+    return h or HEADER_DEFAULT
 
 
 def pad_hex(value: int, width: int) -> str:
@@ -890,161 +912,287 @@ def pad_hex(value: int, width: int) -> str:
     return h.zfill(width)
 
 
-def build_response(nonce: int, message: int, msg_bits: int = HASH_BITS) -> str:
-    """padded nonce : padded message : padded sha256(padded nonce : padded message)."""
+def digest_text(header: str, nonce_hex: str, msg_hex: str) -> bytes:
+    return hashlib.sha256((header + DELIM + nonce_hex + DELIM + msg_hex).encode("ascii")).digest()
+
+
+def build_response(header: str, nonce: int, message: int, msg_bits: int = HASH_BITS) -> str:
+    """header : padded nonce : padded message : sha256 as a 512-bit padded hex field."""
+    h = sanitize_header(header)
     n = pad_hex(nonce, NONCE_HEX)
     m = pad_hex(message, (msg_bits + 3) // 4)
-    d = hashlib.sha256((n + DELIM + m).encode("ascii")).hexdigest()
-    return DELIM.join((n, m, pad_hex(int(d, 16), DIGEST_HEX)))
+    d = int.from_bytes(digest_text(h, n, m), "big")
+    return DELIM.join((h, n, m, pad_hex(d, DIGEST_HEX)))
+
+
+def digest_zero_bits(d_field: str) -> int:
+    """Leading zero bits of the 256-bit digest inside the 512-bit padded field."""
+    return 256 - int(d_field, 16).bit_length()
 
 
 def verify_response(resp: str) -> bool:
-    """Recompute the SHA-256 field from the nonce and message fields."""
+    """Recompute the sha256 field from header, nonce and message."""
     try:
-        n, m, d = resp.split(DELIM)
-        int(n, 16), int(m, 16)
+        h, n, m, d = resp.split(DELIM)
+        int(n, 16), int(m, 16), int(d, 16)
     except ValueError:
         return False
-    return (len(n) == NONCE_HEX and len(d) == DIGEST_HEX
-            and hashlib.sha256((n + DELIM + m).encode("ascii")).hexdigest() == d)
+    if len(n) != NONCE_HEX or len(d) != DIGEST_HEX or int(d, 16) >> 256:
+        return False
+    return pad_hex(int.from_bytes(digest_text(h, n, m), "big"), DIGEST_HEX) == d
 
 
-class ResponseLatch:
-    """D latch for the delivery string. D = the built response, enable = a verified solve.
-    On the enable edge it captures; otherwise it holds. read() never clears it."""
+# ------------------------------------------------------------------ latch registers + async workers
+class Register:
+    """A latch: holds the newest value and a sequence number. The lock is held only for a pointer
+    swap, so a reader never waits on a slow writer and a writer never waits on a reader."""
 
-    def __init__(self):
+    def __init__(self, value=None):
         self._lock = threading.Lock()
-        self.value = None               # held response (Q)
-        self.frame = None               # frame whose edge loaded it
-        self.loads = 0
-        self.message = None             # message register gathered from the oracle
-        self.msg_bits = HASH_BITS
-        self.msg_frame = None
+        self._v = value
+        self.seq = 0
 
-    def gather(self, message: int, msg_bits: int, frame: int):
-        """Collect the oracle's verified output into the message register (value is held)."""
+    def write(self, value) -> int:
         with self._lock:
-            self.message, self.msg_bits, self.msg_frame = message, msg_bits, frame
+            self._v = value
+            self.seq += 1
+            return self.seq
 
-    def pending(self):
+    def write_unless(self, blocked, value) -> bool:
+        """Write unless blocked(current) is true (compare-and-set; first solver wins)."""
         with self._lock:
-            return (self.message, self.msg_bits, self.msg_frame)
-
-    def capture(self, nonce: int, message: int, msg_bits: int, frame: int) -> str:
-        resp = build_response(nonce, message, msg_bits)
-        with self._lock:
-            self.value, self.frame = resp, frame
-            self.loads += 1
-            if self.message == message:         # the gathered message is now delivered
-                self.message = None
-        return resp
+            if blocked(self._v):
+                return False
+            self._v = value
+            self.seq += 1
+            return True
 
     def read(self):
         with self._lock:
-            return self.value
-
-    def clear(self):
-        with self._lock:
-            self.value = self.frame = None
+            return self.seq, self._v
 
 
-
-# ------------------------------------------------------------------ threaded PoW miner
-MINER_DIFF_DEFAULT = 20             # leading zero bits (about 1M hashes)
-MINER_DIFF_MAX = 40
-
-
-def leading_zero_bits(hex_digest: str) -> int:
-    return len(hex_digest) * 4 - int(hex_digest, 16).bit_length()
+@dataclass(frozen=True)
+class MinerConfig:
+    header: str = HEADER_DEFAULT
+    difficulty: int = MINER_DIFF_DEFAULT
 
 
-class PowMiner:
-    """One background thread. Jobs come from the oracle (a verified message); for each job it
-    searches nonce so that sha256("<padded nonce>:<padded message>") has >= difficulty leading
-    zero bits, then completes the response latch with that nonce."""
+class AsyncWorker(threading.Thread):
+    """A thread that runs its own asyncio loop. Subclasses implement main()."""
 
-    def __init__(self, latch: "ResponseLatch"):
-        self.latch = latch
-        self.jobs = queue.Queue(maxsize=16)
-        self.events = queue.Queue()
-        self.difficulty = MINER_DIFF_DEFAULT
-        self.running = False
-        self.status = "stopped"
-        self.hashes = 0                 # all hashes tried
-        self.found = 0
-        self.hps = 0.0
-        self.last = None                # dict of the latest solved job
-        self._stop = threading.Event()
-        self._thread = None
-
-    def set_difficulty(self, bits: int):
-        self.difficulty = max(1, min(MINER_DIFF_MAX, int(bits)))
-
-    def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self.running = True
-        self.status = "waiting for oracle"
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        # a message the latch already gathered while the miner was off becomes a job now
-        msg, bits, frame = self.latch.pending()
-        if msg is not None:
-            self.submit(msg, bits, frame)
+    def __init__(self, name: str):
+        super().__init__(daemon=True, name=name)
+        self._halt = threading.Event()
 
     def stop(self):
-        self._stop.set()
-        self.running = False
+        self._halt.set()
 
-    def submit(self, message: int, bits: int, frame: int) -> bool:
-        try:
-            self.jobs.put_nowait((message, bits, frame))
-            return True
-        except queue.Full:
-            return False
+    def stopped(self) -> bool:
+        return self._halt.is_set()
 
-    def _run(self):
-        while not self._stop.is_set():
+    def run(self):
+        asyncio.run(self.main())
+
+    async def main(self):
+        raise NotImplementedError
+
+
+class OracleWorker(AsyncWorker):
+    """Consumes ticks (one per armed camera frame), asks the higher/lower oracle one question per
+    tick, and writes each verified solve into the message latch. It never waits for the camera
+    loop or the miners; with no tick it just sleeps briefly."""
+
+    def __init__(self, search, msg_reg: Register):
+        super().__init__("oracle")
+        self.search = search
+        self.msg_reg = msg_reg
+        self.ticks = deque(maxlen=20000)      # (frame idx, x); append/popleft are thread-safe
+        self.hits = deque(maxlen=1000)        # finished solves for the camera loop to collect
+        self.processed = 0
+
+    def tick(self, idx: int, x: int):
+        self.ticks.append((idx, x))           # never blocks, drops the oldest when full
+
+    def take_hits(self):
+        out = []
+        while True:
             try:
-                job = self.jobs.get(timeout=0.2)
-            except queue.Empty:
-                self.status = "waiting for oracle"
+                out.append(self.hits.popleft())
+            except IndexError:
+                return out
+
+    async def main(self):
+        while not self.stopped():
+            n = 0
+            while n < 256:
+                try:
+                    idx, x = self.ticks.popleft()
+                except IndexError:
+                    break
+                n += 1
+                self.processed += 1
+                if self.search.guess():
+                    sn = self.search.snapshot()
+                    found = sn["last_found"]
+                    if found is None:
+                        continue
+                    self.msg_reg.write(dict(message=found[0], bits=sn["bits"], frame=idx))
+                    self.hits.append(dict(frame=idx, x=x, bits=sn["bits"], solves=sn["solves"],
+                                          avg=sn["avg"], found=found))
+            await asyncio.sleep(0 if n else 0.01)
+
+
+class MinerLane(AsyncWorker):
+    """One mining lane. Reads the message latch and config latch, hashes from its own random nonce,
+    and publishes a solution to the response latch (first solver of a job wins). It stops working
+    on a job only because a latch it read changed or already holds that job's solution."""
+
+    def __init__(self, lane: int, msg_reg, cfg_reg, resp_reg):
+        super().__init__(f"miner-{lane}")
+        self.lane = lane
+        self.msg_reg, self.cfg_reg, self.resp_reg = msg_reg, cfg_reg, resp_reg
+        self.hashes = 0
+        self.solved = 0
+        self.hps = 0.0
+        self.status = "starting"
+
+    async def main(self):
+        while not self.stopped():
+            mseq, job = self.msg_reg.read()
+            cseq, cfg = self.cfg_reg.read()
+            if job is None:
+                self.status, self.hps = "waiting for oracle", 0.0
+                await asyncio.sleep(0.05)
                 continue
-            self._mine(*job)
+            key = (mseq, cseq)
+            _, rec = self.resp_reg.read()
+            if rec is not None and rec["key"] == key:
+                self.status, self.hps = "job solved, idle", 0.0
+                await asyncio.sleep(0.05)
+                continue
+            await self._mine(key, job, cfg)
         self.status = "stopped"
 
-    def _mine(self, message: int, bits: int, frame: int):
-        suffix = DELIM + pad_hex(message, (bits + 3) // 4)
-        nonce = secrets.randbits(NONCE_HEX * 4 - 32)      # random start, room to count up
+    async def _mine(self, key, job, cfg: MinerConfig):
+        header = sanitize_header(cfg.header)
+        msg_hex = pad_hex(job["message"], (job["bits"] + 3) // 4)
+        head = header + DELIM
+        tail = DELIM + msg_hex
+        target = 1 << (256 - cfg.difficulty)
+        nonce = secrets.randbits(NONCE_HEX * 4 - 32)        # own random start, room to count up
         tried, t0 = 0, time.perf_counter()
-        self.status = f"mining (frame {frame})"
         sha = hashlib.sha256
-        while not self._stop.is_set():
-            target = 1 << (256 - self.difficulty)          # live: the GUI may change it
-            for i in range(4096):
-                d = sha((format(nonce, "064x") + suffix).encode("ascii")).digest()
+        self.status = f"mining frame {job['frame']}"
+        while not self.stopped():
+            for i in range(1024):
+                d = sha((head + format(nonce, "064x") + tail).encode("ascii")).digest()
                 val = int.from_bytes(d, "big")
                 if val < target:
                     tried += i + 1
                     self.hashes += i + 1
                     secs = time.perf_counter() - t0
-                    resp = self.latch.capture(nonce, message, bits, frame)
-                    self.found += 1
-                    self.last = dict(frame=frame, tried=tried, secs=secs,
-                                     lz=256 - val.bit_length())
-                    self.events.put(dict(self.last, response=resp))
-                    self.status = "waiting for oracle"
+                    resp = build_response(header, nonce, job["message"], job["bits"])
+                    rec = dict(key=key, response=resp, frame=job["frame"], lane=self.lane,
+                               tried=tried, secs=secs, lz=256 - val.bit_length())
+                    if self.resp_reg.write_unless(
+                            lambda cur: cur is not None and cur["key"] == key, rec):
+                        self.solved += 1
                     return
                 nonce += 1
-            tried += 4096
-            self.hashes += 4096
+            tried += 1024
+            self.hashes += 1024
             self.hps = tried / max(time.perf_counter() - t0, 1e-9)
-        try:                                               # stopped mid-job: keep it for later
-            self.jobs.put_nowait((message, bits, frame))
-        except queue.Full:
-            pass
+            await asyncio.sleep(0)                           # let this lane's loop breathe
+            if self.msg_reg.seq != key[0] or self.cfg_reg.seq != key[1]:
+                return                                       # inputs changed (a read, not a wait)
+            _, rec = self.resp_reg.read()
+            if rec is not None and rec["key"] == key:
+                return                                       # another lane already solved it
+
+
+class MinerPool:
+    """Starts and stops independent lanes. Lanes share nothing but the three latches."""
+
+    def __init__(self, msg_reg, cfg_reg, resp_reg):
+        self.regs = (msg_reg, cfg_reg, resp_reg)
+        self.lanes = []
+        self.solved_total = 0
+        self.hashes_total = 0
+
+    @property
+    def running(self) -> bool:
+        return any(l.is_alive() and not l.stopped() for l in self.lanes)
+
+    def start(self, n: int = MINER_LANES_DEFAULT):
+        if self.running:
+            return
+        n = max(1, min(MINER_LANES_MAX, int(n)))
+        self.lanes = [MinerLane(i, *self.regs) for i in range(n)]
+        for l in self.lanes:
+            l.start()
+
+    def stop(self):
+        for l in self.lanes:
+            l.stop()
+        self.solved_total += sum(l.solved for l in self.lanes)
+        self.hashes_total += sum(l.hashes for l in self.lanes)
+        self.lanes = []
+
+    def snapshot(self) -> dict:
+        lanes = list(self.lanes)
+        return dict(running=self.running, n=len(lanes),
+                    hps=sum(l.hps for l in lanes),
+                    hashes=self.hashes_total + sum(l.hashes for l in lanes),
+                    solved=self.solved_total + sum(l.solved for l in lanes),
+                    status=(lanes[0].status if len(lanes) == 1 else
+                            "; ".join(sorted({l.status.split(" frame")[0] for l in lanes})))
+                    if lanes else "stopped")
+
+
+class HashPipeline:
+    """Owns the latches and the workers. Starting or stopping one worker never affects another."""
+
+    def __init__(self, search):
+        self.search = search
+        self.msg = Register()                       # oracle -> miners
+        self.cfg = Register(MinerConfig())          # GUI -> miners
+        self.resp = Register()                      # miners -> GUI
+        self.oracle = OracleWorker(search, self.msg)
+        self.miners = MinerPool(self.msg, self.cfg, self.resp)
+
+    def start(self, lanes: int = MINER_LANES_DEFAULT):
+        if not self.oracle.is_alive():
+            self.oracle.start()
+        self.miners.start(lanes)
+
+    def shutdown(self):
+        self.oracle.stop()
+        self.miners.stop()
+
+    def set_config(self, header=None, difficulty=None) -> MinerConfig:
+        _, cur = self.cfg.read()
+        header = cur.header if header is None else sanitize_header(header)
+        diff = cur.difficulty if difficulty is None else max(1, min(MINER_DIFF_MAX, int(difficulty)))
+        new = MinerConfig(header, diff)
+        if new != cur:
+            self.cfg.write(new)
+        return new
+
+    def response(self):
+        """Held response string, or None."""
+        _, rec = self.resp.read()
+        return rec["response"] if rec else None
+
+    def clear_response(self):
+        """Empty the output latch without making the miners redo the job (same key)."""
+        _, rec = self.resp.read()
+        if rec is not None and rec["response"] is not None:
+            self.resp.write(dict(rec, response=None))
+
+    def message(self):
+        _, job = self.msg.read()
+        return job
 
 
 class BinarySearch:
@@ -1784,7 +1932,7 @@ class SimThread(threading.Thread):
         ctl, out = self.ctl, self.out
         hidden = ctl.get("hidden")
         search = ctl.get("search")
-        latch = ctl.get("latch")
+        oracle = ctl.get("oracle")
         fsearch = ctl.get("fsearch")
         try:
             src = Source(self.cam_index)
@@ -1971,28 +2119,19 @@ class SimThread(threading.Thread):
 
                 # Higher/lower search: one oracle guess per armed frame (two sequential evens)
                 search_hit = False
-                if search is not None and ctl.get("search_on", True) and even_state:
-                    search_hit = search.guess()
-                    if search_hit:
+                # The oracle runs in its own thread: the frame loop only pulses a tick (never blocks)
+                # and collects whatever solves the oracle finished in the meantime.
+                if oracle is not None and ctl.get("search_on", True) and even_state:
+                    oracle.tick(idx, x)
+                if oracle is not None:
+                    for h in oracle.take_hits():
+                        search_hit = True
                         ctl["timecode_pending"] = ctl.get("timecode_pending", 0) + 1
                         S["search_timecodes"] += 1
                         S["timecodes_added"] += 1
-                        sn = search.snapshot()
-                        out.put(("search_hit", dict(frame=idx, x=x, bits=sn["bits"],
-                                                    solves=sn["solves"], avg=sn["avg"],
-                                                    found=sn["last_found"])))
-                        if latch is not None:            # the latch gathers the oracle's output
-                            msg = sn["last_found"][0]
-                            latch.gather(msg, sn["bits"], idx)
-                            pm = ctl.get("miner")
-                            if pm is not None and pm.running:     # PoW: miner thread finds the nonce
-                                ok = pm.submit(msg, sn["bits"], idx)
-                                out.put(("log", f"ORACLE -> LATCH frame {idx}: message gathered, "
-                                                + ("sent to the PoW miner" if ok
-                                                   else "miner queue full, dropped")))
-                            else:                                 # no miner: frame hash as nonce
-                                resp = latch.capture(pkt.rand_int, msg, sn["bits"], idx)
-                                out.put(("response", dict(frame=idx, response=resp)))
+                        out.put(("search_hit", dict(frame=h["frame"], x=h["x"], bits=h["bits"],
+                                                    solves=h["solves"], avg=h["avg"],
+                                                    found=h["found"])))
                 if search is not None:
                     S["search"] = search.snapshot()
 
@@ -2310,10 +2449,10 @@ class App:
         self.ctl["hidden"] = self.hidden
         self.search = BinarySearch(SEARCH_BITS_DEFAULT)
         self.ctl["search"] = self.search
-        self.latch = ResponseLatch()
-        self.ctl["latch"] = self.latch
-        self.miner = PowMiner(self.latch)
-        self.ctl["miner"] = self.miner
+        self.pipe = HashPipeline(self.search)          # oracle worker + latches + miner lanes
+        self.ctl["oracle"] = self.pipe.oracle
+        self.pipe.start(MINER_LANES_DEFAULT)
+        self._seen_resp = 0
         self.pool = EntropyPool()
         self.fsearch = FactorSearch(self.pool)
         self.ctl.update(fsearch=self.fsearch, fsearch_on=True, pool=self.pool)
@@ -2694,38 +2833,58 @@ class App:
 
         lrow = ttk.Frame(box)
         lrow.pack(anchor="w", padx=6)
-        ttk.Label(lrow, text="Response latch  nonce:message:sha256",
+        ttk.Label(lrow, text="Response latch  header:nonce:message:sha256 (512-bit pad)",
                   font=("Arial", 9, "bold")).pack(side="left")
         ttk.Button(lrow, text="Copy", command=self._latch_copy).pack(side="left", padx=(12, 2))
         ttk.Button(lrow, text="Verify", command=self._latch_verify).pack(side="left", padx=2)
         ttk.Button(lrow, text="Clear", command=self._latch_clear).pack(side="left", padx=2)
-        mrow = ttk.Frame(box)
-        mrow.pack(anchor="w", padx=6, pady=(4, 0))
-        self.b_miner = ttk.Button(mrow, text="Start PoW miner", command=self._miner_toggle)
-        self.b_miner.pack(side="left")
-        ttk.Label(mrow, text="Difficulty (leading zero bits)").pack(side="left", padx=(12, 2))
+
+        hrow = ttk.Frame(box)
+        hrow.pack(anchor="w", padx=6, pady=(4, 0))
+        ttk.Label(hrow, text="Header").pack(side="left")
+        self.v_hdr = tk.StringVar(value=HEADER_DEFAULT)
+        self.e_hdr = ttk.Entry(hrow, width=18, textvariable=self.v_hdr)
+        self.e_hdr.pack(side="left", padx=(2, 4))
+        for ev in ("<Return>", "<FocusOut>"):
+            self.e_hdr.bind(ev, lambda e: self.root.after_idle(self._config_changed), add="+")
+        ttk.Button(hrow, text="Apply", command=self._config_changed).pack(side="left")
+        ttk.Label(hrow, text="Difficulty (zero bits)").pack(side="left", padx=(12, 2))
         self.v_mdiff = tk.StringVar(value=str(MINER_DIFF_DEFAULT))
-        self.s_mdiff = ttk.Spinbox(mrow, from_=1, to=MINER_DIFF_MAX, width=4,
-                                   textvariable=self.v_mdiff, command=self._miner_diff_changed)
+        self.s_mdiff = ttk.Spinbox(hrow, from_=1, to=MINER_DIFF_MAX, width=4,
+                                   textvariable=self.v_mdiff, command=self._config_changed)
         self.s_mdiff.pack(side="left")
         for ev in ("<Return>", "<FocusOut>"):
-            self.s_mdiff.bind(ev, lambda e: self.root.after_idle(self._miner_diff_changed), add="+")
-        mbox, self.l_miner_stat = fixed_label(box, 480, 34, text="", font=("Consolas", 9),
+            self.s_mdiff.bind(ev, lambda e: self.root.after_idle(self._config_changed), add="+")
+
+        mrow = ttk.Frame(box)
+        mrow.pack(anchor="w", padx=6, pady=(4, 0))
+        self.b_miner = ttk.Button(
+            mrow, text="Stop PoW miners" if self.pipe.miners.running else "Start PoW miners",
+            command=self._miner_toggle)
+        self.b_miner.pack(side="left")
+        ttk.Label(mrow, text="Threads").pack(side="left", padx=(12, 2))
+        self.v_lanes = tk.StringVar(value=str(MINER_LANES_DEFAULT))
+        ttk.Spinbox(mrow, from_=1, to=MINER_LANES_MAX, width=4,
+                    textvariable=self.v_lanes).pack(side="left")
+        ttk.Label(mrow, text="(applies on next Start)").pack(side="left", padx=(6, 0))
+
+        mbox, self.l_miner_stat = fixed_label(box, 480, 50, text="", font=("Consolas", 9),
                                               justify="left", wraplength=480)
         mbox.pack(anchor="w", padx=6)
-        self.t_latch = tk.Text(box, height=5, width=64, font=("Consolas", 8), wrap="char",
+        self.t_latch = tk.Text(box, height=6, width=64, font=("Consolas", 8), wrap="char",
                                state="disabled")
         self.t_latch.pack(anchor="w", padx=6, pady=(2, 6))
         self._show_latch()
 
     def _show_latch(self):
-        v = self.latch.read()
-        msg, bits, frm = self.latch.pending()
+        v = self.pipe.response()
+        job = self.pipe.message()
         if v:
             txt = v
-        elif msg is not None:
-            txt = (f"oracle message gathered (frame {frm}): {short_int(msg, 16)}\n"
-                   "waiting for the PoW miner nonce (press Start PoW miner)")
+        elif job is not None:
+            txt = (f"oracle message latched (frame {job['frame']}): {short_int(job['message'], 16)}\n"
+                   + ("miners are hashing for a nonce" if self.pipe.miners.running
+                      else "miners stopped: press Start PoW miners"))
         else:
             txt = "latch empty (waiting for a verified hash prediction from the oracle)"
         self.t_latch.config(state="normal")
@@ -2734,57 +2893,71 @@ class App:
         self.t_latch.config(state="disabled")
 
     def _miner_toggle(self):
-        if self.miner.running:
-            self.miner.stop()
-            self.b_miner.config(text="Start PoW miner")
-            self._log("# PoW miner stopped")
+        if self.pipe.miners.running:
+            self.pipe.miners.stop()
+            self.b_miner.config(text="Start PoW miners")
+            self._log("# PoW miners stopped (oracle keeps running)")
         else:
-            self._miner_diff_changed()
-            self.miner.start()
-            self.b_miner.config(text="Stop PoW miner")
-            self._log(f"# PoW miner started (difficulty {self.miner.difficulty} bits)")
-            self._show_latch()
+            self._config_changed()
+            try:
+                n = int(self.v_lanes.get().strip())
+            except (ValueError, tk.TclError):
+                n = MINER_LANES_DEFAULT
+            self.pipe.miners.start(n)
+            self.b_miner.config(text="Stop PoW miners")
+            self._log(f"# PoW miners started: {len(self.pipe.miners.lanes)} threads")
+        self._show_latch()
 
-    def _miner_diff_changed(self, _e=None):
+    def _config_changed(self, _e=None):
+        diff = None
         try:
-            self.miner.set_difficulty(int(self.v_mdiff.get().strip()))
+            diff = int(self.v_mdiff.get().strip())
         except (ValueError, tk.TclError):
             pass
+        cfg = self.pipe.set_config(header=self.v_hdr.get(), difficulty=diff)
+        if self.v_hdr.get() != cfg.header:
+            self.v_hdr.set(cfg.header)                  # show the sanitized header
 
     def _miner_tick(self):
-        m = self.miner
-        got = False
-        try:
-            while True:
-                ev = m.events.get_nowait()
-                got = True
-                self._log(f"POW SOLVED frame {ev['frame']:5d}: {ev['lz']} zero bits after "
-                          f"{ev['tried']} hashes in {ev['secs']:.1f}s; latch loaded")
-                self._log(ev["response"])
-        except queue.Empty:
-            pass
-        if got:
+        seq, rec = self.pipe.resp.read()
+        if seq != self._seen_resp:
+            self._seen_resp = seq
+            if rec is not None and rec["response"] is not None:
+                self._log(f"POW SOLVED frame {rec['frame']:5d} lane {rec['lane']}: {rec['lz']} zero bits, "
+                          f"{rec['tried']} hashes in {rec['secs']:.1f}s; response latched")
+                self._log(rec["response"])
             self._show_latch()
+        elif self.pipe.message() is not None and self.pipe.response() is None:
+            self._show_latch()
+        ms = self.pipe.miners.snapshot()
+        o = self.pipe.oracle
+        sn = self.search.snapshot()
         set_text(self.l_miner_stat, (
-            f"miner: {m.status}   {m.hps / 1000:.0f} kH/s   difficulty {m.difficulty} bits\n"
-            f"hashes {m.hashes}   solved {m.found}   queued jobs {m.jobs.qsize()}"))
+            f"oracle thread: {sn['pooled_n']}/{sn['bits']} bits pooled   solves {sn['solves']}   "
+            f"ticks waiting {len(o.ticks)}\n"
+            f"miners: {ms['n']} threads, {ms['status']}   {ms['hps'] / 1000:.0f} kH/s   "
+            f"hashes {ms['hashes']}   solved {ms['solved']}"))
         self.root.after(250, self._miner_tick)
 
     def _latch_copy(self):
-        v = self.latch.read()
+        v = self.pipe.response()
         if v:
             self.window.clipboard_clear()
             self.window.clipboard_append(v)
             self._log("# latch: response copied to clipboard")
 
     def _latch_verify(self):
-        v = self.latch.read()
-        self._log("# latch: " + ("empty" if not v else
-                                  f"sha256 field matches nonce:message, {leading_zero_bits(v.split(DELIM)[2])} leading zero bits" if verify_response(v)
-                                  else "VERIFY FAILED"))
+        v = self.pipe.response()
+        if not v:
+            self._log("# latch: empty")
+        elif verify_response(v):
+            self._log(f"# latch: sha256 field matches header:nonce:message, "
+                      f"{digest_zero_bits(v.split(DELIM)[3])} leading zero bits (of 256)")
+        else:
+            self._log("# latch: VERIFY FAILED")
 
     def _latch_clear(self):
-        self.latch.clear()
+        self.pipe.clear_response()
         self._show_latch()
         self._log("# latch: cleared")
 
@@ -3255,7 +3428,7 @@ class App:
     def _close(self):
         self.ctl["stop"] = True
         self.fsearch.cancel()
-        self.miner.stop()
+        self.pipe.shutdown()
         self.hidden.stop()
         self.root.after(150, self.root.destroy)
 
@@ -3300,11 +3473,6 @@ class App:
                 elif kind == "log":
                     self._log(ev[1])
                     self._show_latch()
-                elif kind == "response":
-                    rp = ev[1]
-                    self._show_latch()
-                    self._log(f"LATCH LOADED frame {rp['frame']:5d} (nonce:message:sha256)")
-                    self._log(rp["response"])
                 elif kind == "analysis":
                     self.an_lines = ev[1]
                     self._show_analysis()
