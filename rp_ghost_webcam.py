@@ -20,6 +20,7 @@ Run:      python rp_ghost_webcam.py --camera 0 --bits 20
           python rp_ghost_webcam.py --simulate        (no webcam)
           python rp_ghost_webcam.py --benchmark       (compare mining styles)
           python rp_ghost_webcam.py --benchmark --bench-bits 20 --trials 30
+          python rp_ghost_webcam.py --benchmark-nonce --nonce-bits 20 --trials 10
 """
 
 import argparse
@@ -238,6 +239,70 @@ def benchmark(oracle: "WebcamOracle", bits: int, trials: int):
     print("Expectation values, not upper bounds. Pool/network targets are far harder.")
 
 
+def benchmark_nonce(oracle: "WebcamOracle", nonce_bits: int, bits: int, trials: int):
+    """
+    Time to REACH the nonce the oracle generates.
+
+    For each trial:
+      1. oracle gives 64 bits; the low `nonce_bits` bits become the oracle nonce
+      2. a sequential miner hashes nonce 0,1,2,... until it reaches that nonce
+         (this is the time-to-reach)
+      3. we also evaluate the oracle nonce DIRECTLY (1 hash, the oracle 'jump')
+      4. we check whether that nonce actually meets the TEST_BITS target
+
+    Reaching a nonce by counting costs ~nonce hashes. Jumping to it costs 1 hash,
+    but it only wins with probability 2^-bits, so expected search cost is unchanged.
+    """
+    import statistics as st
+
+    mask = (1 << nonce_bits) - 1
+    target = 1 << (256 - bits)
+    src_name = "simulated" if oracle.simulate else "camera"
+    print(f"\nNONCE-REACH BENCHMARK ({src_name} oracle): nonce space 2^{nonce_bits}, "
+          f"target {bits} bits, {trials} trials")
+    print(f"{'trial':>5s} {'oracle nonce':>14s} {'hashes to reach':>16s} "
+          f"{'reach time':>11s} {'direct':>9s} {'valid?':>7s}")
+
+    reach_t, reach_h, direct_t, hits = [], [], [], 0
+    for i in range(trials):
+        n = oracle.oracle_64() & mask
+        extranonce2 = hashlib.sha256(n.to_bytes(8, "big")).digest()[:4]
+        prefix = make_header_prefix(extranonce2)
+
+        # (a) sequential: count up from 0 until we reach the oracle nonce
+        t0 = time.perf_counter()
+        for nonce in range(n + 1):
+            h = sha256d(prefix + struct.pack("<I", nonce))
+        t_reach = time.perf_counter() - t0
+
+        # (b) direct jump: hash only the oracle nonce
+        t0 = time.perf_counter()
+        h = sha256d(prefix + struct.pack("<I", n))
+        t_direct = time.perf_counter() - t0
+
+        ok = int.from_bytes(h[::-1], "big") < target
+        hits += ok
+        reach_t.append(t_reach)
+        reach_h.append(n + 1)
+        direct_t.append(t_direct)
+        print(f"{i+1:>5d} {n:>14,d} {n+1:>16,d} {t_reach:>10.3f}s "
+              f"{t_direct*1e6:>7.1f}us {'YES' if ok else 'no':>7s}")
+
+    rate = sum(reach_h) / sum(reach_t)
+    print(f"\nmean hashes to reach : {st.mean(reach_h):,.0f}   "
+          f"(expected ~2^{nonce_bits - 1} = {2**(nonce_bits-1):,})")
+    print(f"mean reach time      : {st.mean(reach_t):.3f} s at {rate:,.0f} H/s")
+    print(f"mean direct eval     : {st.mean(direct_t)*1e6:.1f} us  (the oracle 'jump')")
+    print(f"valid at {bits} bits      : {hits}/{trials} "
+          f"(expected {trials / 2**bits:.4f} by chance)")
+
+    full = 2 ** 31 / rate
+    print(f"\nFull 32-bit nonce space: mean reach ~2^31 hashes = {fmt_time(full)}, "
+          f"worst case 2^32 = {fmt_time(2 * full)}")
+    print(f"Expected hashes to FIND a valid nonce is still 2^{bits} "
+          f"= {fmt_time(2**bits / rate)}, whether you count or jump.")
+
+
 # ----------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="RP-GHOST webcam oracle (local test)")
@@ -250,10 +315,21 @@ def main():
     ap.add_argument("--benchmark", action="store_true", help="compare mining styles and exit")
     ap.add_argument("--bench-bits", type=int, default=18, help="difficulty bits for --benchmark")
     ap.add_argument("--trials", type=int, default=20, help="trials per style for --benchmark")
+    ap.add_argument("--benchmark-nonce", action="store_true",
+                    help="time to reach the nonce the oracle generates, then exit")
+    ap.add_argument("--nonce-bits", type=int, default=20,
+                    help="oracle nonce width for --benchmark-nonce (max 32)")
     args = ap.parse_args()
 
     print(f"TEST_BITS={args.bits}  expected hashes ~ {2**args.bits:,}")
     oracle = WebcamOracle(args.camera, simulate=args.simulate)
+
+    if args.benchmark_nonce:
+        try:
+            benchmark_nonce(oracle, min(args.nonce_bits, 32), args.bits, args.trials)
+        finally:
+            oracle.close()
+        return
 
     if args.benchmark:
         try:
