@@ -715,7 +715,7 @@ def _tonelli(a: int, p: int) -> int:
             t2 = t2 * t2 % p
             i += 1
         b = pow(c, 1 << (m - i - 1), p)
-        m, c, t, r = i, b * b % p, t * b * b % p, r * b % p
+        m, c, t, r = i, b * b % p, t * b * b % p, r * b * b % p
     return r
 
 
@@ -880,7 +880,7 @@ SEARCH_BITS_MAX = 4096
 def short_int(n: int, keep: int = 20) -> str:
     """Hex form of a big integer, shortened to its first and last digits."""
     h = format(n, "x")
-    return h if len(h) <= 2 * keep + 3 else f"{h[:keep]}...{h[-keep:]} ({len(h) * 4} bit hex)"
+    return h if len(h) <= 2 * keep + 3 else f"{h} ({len(h) * 4} bit hex)"
 
 
 def hash_secret(bits: int) -> int:
@@ -896,12 +896,12 @@ def hash_secret(bits: int) -> int:
 
 # ------------------------------------------------------------------ padded response format
 HEADER_DEFAULT = "RPCAM1"
-HEADER_MAX = 32
-NONCE_HEX = 64                      # 256-bit nonce field
+HEADER_MAX = 64
+NONCE_HEX = 128                      # 256-bit nonce field
 DIGEST_HEX = 128                    # sha256 shown as a 512-bit padded field
 DELIM = ":"
 MINER_DIFF_DEFAULT = 20             # leading zero bits of the 256-bit digest
-MINER_DIFF_MAX = 40
+MINER_DIFF_MAX = 128
 MINER_LANES_DEFAULT = 2
 MINER_LANES_MAX = 16
 
@@ -925,7 +925,7 @@ def digest_text(header: str, nonce_hex: str, msg_hex: str) -> bytes:
 
 
 def build_response(header: str, nonce: int, message: int, msg_bits: int = HASH_BITS) -> str:
-    """header : padded nonce : padded message : sha256 as a 512-bit padded hex field."""
+    """<header>:<padded nonce>:<padded message>:<padded sha256>"""
     h = sanitize_header(header)
     n = pad_hex(nonce, NONCE_HEX)
     m = pad_hex(message, (msg_bits + 3) // 4)
@@ -2350,7 +2350,7 @@ CIRCUIT SETTINGS  ("set NAME VALUE")
   set y EXPR                 time code, e.g. 1111  1000|0011  1111&1011  1011+0001
   set force on|off           read 'forces HIGH' as OR (breaks one-sidedness, Thm 4)
   set overlay on|off         motion overlay flag (kept for the preview image)
-  code                       show what the time code does to the error bound (Thm 1-4)
+  code                       what the time code does to the error bound (Thm 1-4)
   analysis                   print the driver analysis      reset-analysis   zero its counters
 
 HIDDEN NUMBER
