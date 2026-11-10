@@ -3121,10 +3121,1524 @@ def fit_window(win, content_w=1180, content_h=1180):
     win.minsize(640, 420)
 
 
-if __name__ == "__main__":
+"""
+rp_settings_pack_v2.py  -  ~150 settings + automation for rp_circuit_camera.py
+
+Put next to rp_circuit_camera.py and run:   python rp_settings_pack_v2.py
+(The original file is never modified; everything is patched in at run time.)
+Replaces rp_settings_pack.py (v1); the settings file is shared and stays compatible.
+
+Tabs
+  Motion      thresholds, k, blur size, overlay
+  Image       blur type, median, gamma/contrast/brightness, CLAHE/equalize, flicker
+              compensation, temporal smoothing, quantize, sharpen, edge-only mode, ROI
+              (+invert), border mask, gray channel, mirror/rotate, frame decimation,
+              trial-rate limiter                 (all feed the motion detector)
+  Camera      backend, FOURCC, size, fps, buffer, exposure/gain/focus/WB/brightness...
+  Circuit     VS, V_BE, V_IH, RC, node tau, warm-up frames, witness rounds for Driver A
+  Time code   Y, force, target error + Suggest k
+  Gating      query gate for hidden/search/factor: min even-run length, every-Nth,
+              min gap, probability, max per second, multi-query, reward multipliers
+  Sources     hidden/search/factor/BTC options, clock jitter / wander, auto-reset
+  Interface   window alpha/topmost, fonts, colors, plots on/off + decimation, history,
+              overlay colour/alpha, ROI/grid drawing, alerts, confirm-close
+  Automation  autostart, auto-restart, daily schedule, auto-stop, Y rotation, idle
+              recalibration, autosave, analysis resets
+  Capture     snapshots (on time code / motion / periodic, rotation), CSV recorder,
+              stats log, session summary, log file
+  Tools       profiles (built-in + yours), grant/clear bins, resets, snapshot now
+
+Dialog: search box filters all settings, per-row reset button, modified settings are
+red, 30-step Revert, live status line, Show-modified list.
+Hotkeys: F5 start, F6 preview, F7 stop, F8 settings, F9 calibrate, Space start/stop.
+"""
+import csv
+import hashlib
+import json
+import math
+import multiprocessing as mp
+import os
+import random
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+import numpy as np
+
+import rp_circuit_camera as rp
+
+HOME = os.path.expanduser("~")
+SETTINGS_FILE = os.path.join(HOME, ".rp_circuit_settings.json")
+NOCAM = -999                                   # "leave the driver default" for camera properties
+
+DEFAULTS = dict(
+    # --- Motion
+    thr=18, min_px=30, k=5, blur=5, overlay=True,
+    # --- Image
+    blur_type="gaussian", interp="area", median_pre=False,
+    brightness=0, contrast=1.0, gamma=1.0, equalize=False, clahe=False, clahe_clip=2.0,
+    flicker_comp=False, flicker_strength=100, temporal_keep=0.0, quant_bits=0, sharpen=0.0,
+    edge_mode="off", roi_x0=0, roi_y0=0, roi_x1=100, roi_y1=100, roi_invert=False,
+    border_px=0, gray_source="gray", mirror="none", rotate="0",
+    frame_decimate=1, max_trial_hz=0.0,
+    # --- Camera
+    cam_index=0, cam_backend="auto", cam_fourcc="default", cam_w=640, cam_h=480, cam_fps=0,
+    cam_buffer=0, cam_retries=3, exposure="default", cam_exposure_val=NOCAM,
+    cam_gain=NOCAM, cam_brightness=NOCAM, cam_contrast=NOCAM, cam_saturation=NOCAM,
+    cam_focus=NOCAM, cam_wb_temp=NOCAM, autofocus="default", auto_wb="default",
+    # --- Circuit
+    vs=5.0, v_be=0.7, v_ih=3.5, rc_b_ms=4.0, tau_node_ms=4.0, warmup=8, witness_rounds=1,
+    # --- Time code
+    y="1111", force=False, target_err_bits=20,
+    # --- Gating
+    gate_min_evens=2, gate_every_n=1, gate_min_gap_ms=0, gate_prob_pct=100,
+    gate_max_per_sec=0, gate_hidden=True, gate_search=True, gate_factor=True,
+    multi_query=1, reward_hidden=1, reward_search=1, reward_factor=1, pending_cap=0,
+    # --- Sources
+    hidden_on=True, hidden_range=100, hidden_hz=17.0, hidden_jitter_pct=0.0,
+    hidden_wander=False, hidden_wander_min=20.0, hidden_wander_max=2000.0,
+    hidden_autoreset_min=0, search_on=True, search_bits=1000,
+    fsearch_on=True, factor_bits=256, factor_hl=True, btc_period=10, btc_auto_on_start=False,
+    # --- Interface
+    fps_cap=30, compact=False, window_alpha=100, topmost=False, title_prefix="",
+    confirm_close=False, log_font=8, log_height=14, analysis_font=8, verdict_font=11,
+    draw_traj=True, draw_x=True, draw_strip=True, plot_every_n=1, x_hist_len=150,
+    color_wire_on="#d9480f", color_wire_off="#999999", color_box_off="#f1efe8",
+    overlay_color="#ff2828", overlay_alpha=60, show_roi=False, show_grid=False,
+    preview_gray=False,
+    alert_beep=True, alert_false_accept=False, alert_camera_lost=True,
+    alert_cooldown_s=2.0, flash_secs=1.5, beep_count=1,
+    # --- Automation
+    autostart="none", autostart_delay_s=2, auto_restart=False, restart_delay_s=3, restart_max=5,
+    sched_on=False, sched_start="09:00", sched_end="17:00",
+    stop_codes=0, stop_secs=0, stop_frames=0, idle_warn_s=10, recal_idle_min=0,
+    y_rotate=False, y_rotate_s=20, y_rotate_list="1111,1010,1000|0011,11111111",
+    reset_an_on_change=True, analysis_reset_min=0, autosave_s=0,
+    # --- Capture
+    snap_on_code=False, snap_x=0, snap_periodic_s=0, snap_min_gap_s=2.0,
+    snap_dir=os.path.join(HOME, "rp_snaps"), snap_max=200, snap_format="png", snap_full=False,
+    csv_on=False, csv_path=os.path.join(HOME, "rp_stats.csv"), csv_period_s=10,
+    stats_log_s=0, summary_on_stop=True, log_mode="all", log_file=False,
+    log_path=os.path.join(HOME, "rp_circuit.log"),
+)
+
+BUILTIN_PROFILES = {
+    "Quiet room (sensitive)": dict(thr=10, min_px=15, blur=7, k=5),
+    "Busy scene (strict)": dict(thr=28, min_px=120, blur=7, k=8),
+    "Flicker-proof office": dict(flicker_comp=True, temporal_keep=0.3, blur=7, median_pre=True,
+                                 exposure="manual", thr=14),
+    "Night / low light": dict(gamma=0.6, clahe=True, blur=9, median_pre=True, thr=12, min_px=25),
+    "Edge motion only": dict(edge_mode="sobel", thr=30, min_px=40, blur=5),
+    "Door watcher (centre ROI)": dict(roi_x0=25, roi_y0=10, roi_x1=75, roi_y1=100, show_roi=True,
+                                      border_px=2),
+    "Strict RP demo": dict(y="1111", force=False, k=10, target_err_bits=20, witness_rounds=1),
+    "Boosted witness (m=3)": dict(witness_rounds=3, k=3),
+    "Break one-sidedness (Thm 4)": dict(force=True, y="1000", k=5),
+    "Slow analog (RC stress)": dict(rc_b_ms=12.0, v_be=0.8),
+    "Fast hunt (searches)": dict(fps_cap=60, hidden_hz=500.0, hidden_range=100, search_bits=256,
+                                 log_mode="minimal", multi_query=4),
+    "Even-run strict (4 evens)": dict(gate_min_evens=4, gate_prob_pct=100),
+    "Rate-limited sources": dict(gate_every_n=3, gate_max_per_sec=10, gate_min_gap_ms=50),
+    "Soak test (unattended)": dict(auto_restart=True, csv_on=True, stats_log_s=60, autosave_s=60,
+                                   log_mode="events only", summary_on_stop=True, snap_on_code=True),
+    "Low CPU": dict(cam_w=320, cam_h=240, fps_cap=15, compact=True, overlay=False,
+                    log_mode="minimal", draw_traj=False, plot_every_n=3, frame_decimate=2),
+}
+
+SPEC = []
+
+
+def R(tab, key, label, kind, extra=None, commit=False, help_=""):
+    SPEC.append((tab, key, label, kind, extra, commit, help_))
+
+
+# ---- Motion
+R("Motion", "thr", "Pixel diff >", "int", (4, 60, 1), False, "Per-pixel change that counts as moving.")
+R("Motion", "min_px", "Min moving px", "int", (5, 800, 5), False, "Below this: no motion, no instance.")
+R("Motion", "k", "k frames (SELECT window)", "int", (1, 30, 1), False, "SELECT = any Q=1 in the last k frames.")
+R("Motion", "blur", "Blur kernel (0=off)", "int", (0, 15, 1), False, "Even values round up to odd.")
+R("Motion", "overlay", "Show motion overlay", "bool")
+# ---- Image
+I = "Image"
+R(I, "blur_type", "Blur type", "choice", ["gaussian", "median", "box", "bilateral"], False, "Median is best against salt-and-pepper sensor noise.")
+R(I, "interp", "Downscale method", "choice", ["area", "linear", "nearest", "cubic"], False, "AREA averages pixels, which suppresses noise.")
+R(I, "median_pre", "3x3 median before blur", "bool", None, False, "Kills hot pixels.")
+R(I, "brightness", "Brightness offset", "int", (-100, 100, 5), False)
+R(I, "contrast", "Contrast gain", "float", (0.2, 3.0, 0.1), False)
+R(I, "gamma", "Gamma", "float", (0.3, 3.0, 0.1), False, "<1 brightens shadows (night scenes).")
+R(I, "equalize", "Histogram equalise", "bool", None, False, "Takes priority over CLAHE.")
+R(I, "clahe", "CLAHE local contrast", "bool")
+R(I, "clahe_clip", "CLAHE clip limit", "float", (1.0, 8.0, 0.5))
+R(I, "flicker_comp", "Flicker / exposure compensation", "bool", None, False, "Rescales each frame to a slow reference brightness.")
+R(I, "flicker_strength", "Flicker comp strength %", "int", (0, 100, 10))
+R(I, "temporal_keep", "Temporal smoothing (old-frame weight)", "float", (0.0, 0.95, 0.05), False, "Lowers diff amplitude, so lower 'Pixel diff' to match.")
+R(I, "quant_bits", "Quantise to N bits (0=off)", "int", (0, 7, 1), False, "Posterise: ignores tiny level changes.")
+R(I, "sharpen", "Sharpen amount", "float", (0.0, 3.0, 0.25))
+R(I, "edge_mode", "Edge-only motion", "choice", ["off", "sobel", "laplacian"], False, "Moves only edges, ignoring flat-area noise.")
+R(I, "roi_x0", "ROI left %", "int", (0, 99, 5), False, "Motion outside the ROI is ignored.")
+R(I, "roi_y0", "ROI top %", "int", (0, 99, 5))
+R(I, "roi_x1", "ROI right %", "int", (1, 100, 5))
+R(I, "roi_y1", "ROI bottom %", "int", (1, 100, 5))
+R(I, "roi_invert", "Invert ROI (ignore inside)", "bool")
+R(I, "border_px", "Ignore border (px of 128x96)", "int", (0, 20, 1), False, "Edge vignetting and lens noise.")
+R(I, "gray_source", "Gray source", "choice", ["gray", "red", "green", "blue", "hsv-value", "hsv-saturation"], False, "Pick the channel with the best contrast.")
+R(I, "mirror", "Mirror", "choice", ["none", "horizontal", "vertical", "both"])
+R(I, "rotate", "Rotate", "choice", ["0", "90", "180", "270"])
+R(I, "frame_decimate", "Use every Nth camera frame", "int", (1, 10, 1), False, "Larger gaps between compared frames, so slow motion is seen.")
+R(I, "max_trial_hz", "Trial-rate limit Hz (0=off)", "float", (0.0, 240.0, 1.0), False, "Caps trials per second (CPU saver).")
+# ---- Camera
+C = "Camera"
+R(C, "cam_index", "Camera number", "int", (0, 9, 1), True, "Camera settings apply on next Start.")
+R(C, "cam_backend", "Capture backend", "choice", ["auto", "any", "dshow", "msmf", "v4l2", "avfoundation"], True)
+R(C, "cam_fourcc", "Pixel format", "choice", ["default", "MJPG", "YUYV", "H264"], True, "MJPG usually unlocks higher fps.")
+R(C, "cam_w", "Width", "int", (160, 3840, 160), True)
+R(C, "cam_h", "Height", "int", (120, 2160, 120), True)
+R(C, "cam_fps", "FPS request (0=driver)", "int", (0, 240, 5), True)
+R(C, "cam_buffer", "Buffer frames (0=driver)", "int", (0, 10, 1), True, "1 = lowest latency.")
+R(C, "cam_retries", "Open retries", "int", (1, 10, 1), True)
+R(C, "exposure", "Exposure mode", "choice", ["default", "manual", "auto"], True, "'manual' stops auto-exposure pumping.")
+R(C, "cam_exposure_val", f"Exposure value ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "cam_gain", f"Gain ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "cam_brightness", f"Brightness ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "cam_contrast", f"Contrast ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "cam_saturation", f"Saturation ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "cam_focus", f"Focus ({NOCAM}=skip)", "int", (NOCAM, 9999, 1), True)
+R(C, "autofocus", "Autofocus", "choice", ["default", "on", "off"], True, "Focus hunting looks like motion.")
+R(C, "auto_wb", "Auto white balance", "choice", ["default", "on", "off"], True)
+R(C, "cam_wb_temp", f"WB temperature ({NOCAM}=skip)", "int", (NOCAM, 10000, 100), True)
+# ---- Circuit
+K = "Circuit"
+R(K, "vs", "Supply VS (V)", "float", (2.0, 5.3, 0.1), False, "Driver B output voltage.")
+R(K, "v_be", "NPN V_BE (V)", "float", (0.3, 1.0, 0.05))
+R(K, "v_ih", "74HC V_IH (V)", "float", (1.0, 5.0, 0.1), False, "B is HIGH when V(C) - V_BE >= V_IH.")
+R(K, "rc_b_ms", "Link RC (ms)", "float", (0.05, 60.0, 0.5), False, "Large RC: B misses within one frame (link timing misses).")
+R(K, "tau_node_ms", "10 uF node tau (ms)", "float", (0.05, 100.0, 0.5), False, "Applies on next Start.")
+R(K, "warmup", "Warm-up frames", "int", (0, 60, 1), False, "Ignored while auto-exposure settles.")
+R(K, "witness_rounds", "Driver A witness rounds m", "int", (1, 16, 1), False, "Extra hashed witnesses per frame, p -> 1-(1-p)^m. Analysis calibration assumes m=1.")
+# ---- Time code
+T = "Time code"
+R(T, "y", "Time code Y", "str", None, False, "Bits with | & +  e.g. 1000|0011")
+R(T, "force", "'forces HIGH' as OR", "bool", None, False, "Breaks one-sidedness (Thm 4). Demo only.")
+R(T, "target_err_bits", "Target error 2^-E, E =", "int", (1, 60, 1), False, "Used by Suggest k.")
+# ---- Gating
+G = "Gating"
+R(G, "gate_min_evens", "Required sequential evens", "int", (2, 12, 1), False, "Original behaviour = 2.")
+R(G, "gate_every_n", "Let every Nth armed frame through", "int", (1, 100, 1))
+R(G, "gate_min_gap_ms", "Min gap between queries (ms)", "int", (0, 5000, 10))
+R(G, "gate_prob_pct", "Pass probability %", "int", (0, 100, 5))
+R(G, "gate_max_per_sec", "Max queries per second (0=off)", "int", (0, 500, 1))
+R(G, "gate_hidden", "Gate applies to hidden number", "bool")
+R(G, "gate_search", "Gate applies to bit search", "bool")
+R(G, "gate_factor", "Gate applies to factoriser", "bool")
+R(G, "multi_query", "Queries per armed frame (search/factor)", "int", (1, 64, 1), False, "Pools several bits per armed frame.")
+R(G, "reward_hidden", "Bins per hidden-number hit", "int", (1, 20, 1))
+R(G, "reward_search", "Bins per search find", "int", (1, 20, 1))
+R(G, "reward_factor", "Bins per verified factorisation", "int", (1, 20, 1))
+R(G, "pending_cap", "Cap on pending bins (0=off)", "int", (0, 1000, 1))
+# ---- Sources
+S_ = "Sources"
+R(S_, "hidden_on", "Hidden number enabled", "bool")
+R(S_, "hidden_range", "Hidden range 0 to", "int", (2, rp.HIDDEN_RANGE_MAX, 100), True, "Resets hidden counts.")
+R(S_, "hidden_hz", "Hidden clock Hz", "float", (1.0, 2000.0, 1.0), True)
+R(S_, "hidden_jitter_pct", "Clock jitter +/- %", "float", (0.0, 90.0, 5.0), False, "Retuned every 0.5 s around the base Hz.")
+R(S_, "hidden_wander", "Clock wanders between min/max", "bool", None, False, "Overrides jitter.")
+R(S_, "hidden_wander_min", "Wander min Hz", "float", (1.0, 2000.0, 10.0))
+R(S_, "hidden_wander_max", "Wander max Hz", "float", (1.0, 2000.0, 10.0))
+R(S_, "hidden_autoreset_min", "New secret every N min (0=off)", "int", (0, 1440, 1), False, "Also zeroes the luck factor.")
+R(S_, "search_on", "Bit search enabled", "bool")
+R(S_, "search_bits", "Secret bits", "int", (2, rp.SEARCH_BITS_MAX, 8), True, "Resets search counts.")
+R(S_, "fsearch_on", "Factoriser enabled", "bool")
+R(S_, "factor_bits", "Semiprime bits (Generate)", "int", (16, rp.FACTOR_BITS_MAX, 64), True)
+R(S_, "factor_hl", "Typed N: high/low only", "bool")
+R(S_, "btc_period", "BTC check every (s)", "int", (1, 3600, 1), True)
+R(S_, "btc_auto_on_start", "BTC auto-check on launch", "bool", None, False, "Makes a Binance request at startup.")
+# ---- Interface
+U = "Interface"
+R(U, "fps_cap", "GUI redraw cap (fps)", "int", (5, 60, 5))
+R(U, "compact", "Compact layout", "bool")
+R(U, "window_alpha", "Window opacity %", "int", (30, 100, 5))
+R(U, "topmost", "Always on top", "bool")
+R(U, "title_prefix", "Window title prefix", "str", None, True)
+R(U, "confirm_close", "Confirm close while running", "bool")
+R(U, "log_font", "Log font size", "int", (6, 16, 1))
+R(U, "log_height", "Log height (lines)", "int", (4, 50, 1))
+R(U, "analysis_font", "Analysis font size", "int", (6, 14, 1))
+R(U, "verdict_font", "Verdict font size", "int", (8, 24, 1))
+R(U, "draw_traj", "Draw IF/THEN plot", "bool")
+R(U, "draw_x", "Draw x plot", "bool")
+R(U, "draw_strip", "Draw Q strip", "bool")
+R(U, "plot_every_n", "Draw plots every Nth redraw", "int", (1, 30, 1))
+R(U, "x_hist_len", "x plot history (frames)", "int", (50, 1000, 50))
+R(U, "color_wire_on", "Wire ON colour", "str", None, True, "Any Tk colour, e.g. #00aa55")
+R(U, "color_wire_off", "Wire OFF colour", "str", None, True)
+R(U, "color_box_off", "Idle box colour", "str", None, True)
+R(U, "overlay_color", "Motion overlay colour", "str", None, True)
+R(U, "overlay_alpha", "Motion overlay opacity %", "int", (0, 100, 10))
+R(U, "show_roi", "Draw ROI rectangle on preview", "bool")
+R(U, "show_grid", "Draw thirds grid on preview", "bool")
+R(U, "preview_gray", "Gray preview", "bool")
+R(U, "alert_beep", "Beep on time code", "bool")
+R(U, "alert_false_accept", "Beep on false accept", "bool", None, False, "Hear Thm 4 break in Force mode.")
+R(U, "alert_camera_lost", "Beep on unexpected stop", "bool")
+R(U, "alert_cooldown_s", "Alert cooldown (s)", "float", (0.0, 60.0, 0.5))
+R(U, "flash_secs", "Title flash (s)", "float", (0.0, 10.0, 0.5))
+R(U, "beep_count", "Beeps per alert", "int", (1, 5, 1))
+# ---- Automation
+A_ = "Automation"
+R(A_, "autostart", "On launch", "choice", ["none", "preview", "circuit"])
+R(A_, "autostart_delay_s", "Autostart delay (s)", "int", (0, 60, 1))
+R(A_, "auto_restart", "Auto-restart after unexpected stop", "bool")
+R(A_, "restart_delay_s", "Restart delay (s)", "int", (1, 300, 1))
+R(A_, "restart_max", "Max restarts", "int", (1, 1000, 1))
+R(A_, "sched_on", "Daily schedule", "bool")
+R(A_, "sched_start", "Schedule start HH:MM", "str", None, True)
+R(A_, "sched_end", "Schedule end HH:MM", "str", None, True, "Overnight windows work (22:00 to 06:00).")
+R(A_, "stop_codes", "Auto-stop after N time codes", "int", (0, 100000, 1), False, "0 = off")
+R(A_, "stop_secs", "Auto-stop after N seconds", "int", (0, 86400, 10))
+R(A_, "stop_frames", "Auto-stop after N frames", "int", (0, 10_000_000, 100))
+R(A_, "idle_warn_s", "No-motion warning after s", "int", (0, 3600, 1))
+R(A_, "recal_idle_min", "Recalibrate after N idle min", "int", (0, 600, 1), False, "Runs the calibrator when the scene has been still.")
+R(A_, "y_rotate", "Rotate Y through list", "bool")
+R(A_, "y_rotate_s", "Rotate every (s)", "int", (2, 3600, 1))
+R(A_, "y_rotate_list", "Y list (comma separated)", "str")
+R(A_, "reset_an_on_change", "Reset analysis when detector/Y changes", "bool", None, False, "Keeps TPR/FPR tables honest.")
+R(A_, "analysis_reset_min", "Reset analysis every N min", "int", (0, 1440, 1))
+R(A_, "autosave_s", "Autosave settings every N s", "int", (0, 3600, 10))
+# ---- Capture
+P = "Capture"
+R(P, "snap_on_code", "Snapshot on each time code", "bool")
+R(P, "snap_x", "Snapshot when x >= (0=off)", "int", (0, 5000, 10))
+R(P, "snap_periodic_s", "Snapshot every N s during motion", "int", (0, 3600, 1))
+R(P, "snap_min_gap_s", "Min gap between snapshots (s)", "float", (0.0, 600.0, 0.5))
+R(P, "snap_dir", "Snapshot folder", "str", None, True)
+R(P, "snap_max", "Keep newest N snapshots (0=all)", "int", (0, 100000, 10))
+R(P, "snap_format", "Snapshot format", "choice", ["png", "jpg"])
+R(P, "snap_full", "Full-resolution snapshot", "bool")
+R(P, "csv_on", "Record stats to CSV", "bool")
+R(P, "csv_path", "CSV path", "str", None, True)
+R(P, "csv_period_s", "CSV row every N s", "int", (1, 3600, 1))
+R(P, "stats_log_s", "Log stats line every N s (0=off)", "int", (0, 3600, 5))
+R(P, "summary_on_stop", "Session summary on stop", "bool")
+R(P, "log_mode", "Log detail", "choice", ["all", "events only", "minimal"])
+R(P, "log_file", "Also log to file", "bool")
+R(P, "log_path", "Log file path", "str", None, True)
+
+TABS = ["Motion", "Image", "Camera", "Circuit", "Time code", "Gating", "Sources",
+        "Interface", "Automation", "Capture", "Tools"]
+KINDS = {s[1]: (s[3], s[4]) for s in SPEC}
+COMMIT = {s[1] for s in SPEC if s[5]}
+Y_PRESETS = ["1111", "1010", "11111111", "10000000", "1000|0011", "1111&1011", "1011+0001"]
+RESET_AN_KEYS = {"thr", "min_px", "blur", "y", "force", "witness_rounds", "blur_type", "edge_mode",
+                 "roi_x0", "roi_y0", "roi_x1", "roi_y1", "roi_invert", "gray_source", "temporal_keep"}
+PACK = None
+ST = {}                                      # image-pipeline state (EMA frame, flicker ref, ROI mask)
+
+
+def cfg():
+    return PACK.cfg if PACK else DEFAULTS
+
+
+def parse_val(kind, s, extra):
+    if kind == "bool":
+        return bool(s)
+    if kind == "int":
+        return max(extra[0], min(extra[1], int(float(s))))
+    if kind == "float":
+        return max(extra[0], min(extra[1], float(s)))
+    return str(s)
+
+
+# ------------------------------------------------------------------ runtime patches
+def _roi_mask(c):
+    key = (c["roi_x0"], c["roi_y0"], c["roi_x1"], c["roi_y1"], c["roi_invert"], c["border_px"])
+    if ST.get("mk") != key:
+        x0, x1 = sorted((c["roi_x0"], c["roi_x1"]))
+        y0, y1 = sorted((c["roi_y0"], c["roi_y1"]))
+        X0, X1 = int(rp.SW * x0 / 100), max(int(rp.SW * x0 / 100) + 1, int(rp.SW * x1 / 100))
+        Y0, Y1 = int(rp.SH * y0 / 100), max(int(rp.SH * y0 / 100) + 1, int(rp.SH * y1 / 100))
+        inside = np.zeros((rp.SH, rp.SW), bool)
+        inside[Y0:Y1, X0:X1] = True
+        m = ~inside if c["roi_invert"] else inside
+        b = c["border_px"]
+        if b > 0:
+            m[:b] = m[-b:] = False
+            m[:, :b] = m[:, -b:] = False
+        ST["mk"], ST["m"], ST["full"] = key, m, bool(m.all())
+    return ST["m"], ST["full"]
+
+
+def _install_core_patches():
+    cv2 = rp.cv2
+    interps = {}
+    if cv2 is not None:
+        interps = {"area": cv2.INTER_AREA, "linear": cv2.INTER_LINEAR,
+                   "nearest": cv2.INTER_NEAREST, "cubic": cv2.INTER_CUBIC}
+    luts = {}
+
+    def downscale(gray):
+        c = cfg()
+        small = cv2.resize(gray, (rp.SW, rp.SH), interpolation=interps[c["interp"]])
+        if c["median_pre"]:
+            small = cv2.medianBlur(small, 3)
+        if c["brightness"] or c["contrast"] != 1.0:
+            small = cv2.convertScaleAbs(small, alpha=c["contrast"], beta=c["brightness"])
+        g = c["gamma"]
+        if g != 1.0:
+            lut = luts.get(g)
+            if lut is None:
+                lut = luts[g] = (255.0 * (np.arange(256) / 255.0) ** (1.0 / g)).astype(np.uint8)
+            small = cv2.LUT(small, lut)
+        if c["equalize"]:
+            small = cv2.equalizeHist(small)
+        elif c["clahe"]:
+            small = cv2.createCLAHE(clipLimit=c["clahe_clip"], tileGridSize=(8, 8)).apply(small)
+        if c["flicker_comp"]:
+            m = float(small.mean())
+            ref = ST.get("ref")
+            ST["ref"] = m if ref is None else ref * 0.98 + m * 0.02
+            gain = 1.0 + c["flicker_strength"] / 100.0 * (ST["ref"] / max(m, 1.0) - 1.0)
+            if abs(gain - 1.0) > 0.002:
+                small = np.clip(small.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+        k = int(c["blur"])
+        if k >= 3:
+            k |= 1
+            bt = c["blur_type"]
+            if bt == "gaussian":
+                small = cv2.GaussianBlur(small, (k, k), 0)
+            elif bt == "median":
+                small = cv2.medianBlur(small, min(k, 15))
+            elif bt == "box":
+                small = cv2.blur(small, (k, k))
+            else:
+                small = cv2.bilateralFilter(small, k, 50, 50)
+        if c["sharpen"] > 0:
+            soft = cv2.GaussianBlur(small, (0, 0), 1.0)
+            small = cv2.addWeighted(small, 1 + c["sharpen"], soft, -c["sharpen"], 0)
+        em = c["edge_mode"]
+        if em == "sobel":
+            gx = cv2.convertScaleAbs(cv2.Sobel(small, cv2.CV_16S, 1, 0))
+            gy = cv2.convertScaleAbs(cv2.Sobel(small, cv2.CV_16S, 0, 1))
+            small = cv2.addWeighted(gx, 0.5, gy, 0.5, 0)
+        elif em == "laplacian":
+            small = cv2.convertScaleAbs(cv2.Laplacian(small, cv2.CV_16S, ksize=3))
+        keep = c["temporal_keep"]
+        if keep > 0:
+            ema = ST.get("ema")
+            ST["ema"] = small.astype(np.float32) if ema is None else keep * ema + (1 - keep) * small
+            small = ST["ema"].astype(np.uint8)
+        qb = int(c["quant_bits"])
+        if 1 <= qb <= 7:
+            small = small & np.uint8((0xFF << (8 - qb)) & 0xFF)
+        m, full = _roi_mask(c)
+        if not full:
+            small = np.where(m, small, 0).astype(np.uint8)
+        return np.ascontiguousarray(small)
+    rp.downscale = downscale
+
+    # ---- camera open and read
+    def src_init(self, index):
+        if cv2 is None:
+            raise RuntimeError("OpenCV is not installed.  Run: pip install opencv-python")
+        c = cfg()
+        names = {"dshow": "CAP_DSHOW", "msmf": "CAP_MSMF", "v4l2": "CAP_V4L2",
+                 "avfoundation": "CAP_AVFOUNDATION", "any": "CAP_ANY"}
+        if c["cam_backend"] == "auto":
+            backend = cv2.CAP_DSHOW if rp.sys.platform == "win32" else cv2.CAP_ANY
+        else:
+            backend = getattr(cv2, names[c["cam_backend"]], cv2.CAP_ANY)
+        cap = None
+        for attempt in range(int(c["cam_retries"])):
+            cap = cv2.VideoCapture(index, backend)
+            if c["cam_fourcc"] != "default":
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*c["cam_fourcc"]))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, c["cam_w"])
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, c["cam_h"])
+            if c["cam_fps"] > 0:
+                cap.set(cv2.CAP_PROP_FPS, c["cam_fps"])
+            if c["cam_buffer"] > 0:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, c["cam_buffer"])
+            if c["exposure"] != "default":
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25 if c["exposure"] == "manual" else 0.75)
+            if c["autofocus"] != "default":
+                cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if c["autofocus"] == "on" else 0)
+            if c["auto_wb"] != "default":
+                cap.set(cv2.CAP_PROP_AUTO_WB, 1 if c["auto_wb"] == "on" else 0)
+            for key, prop in (("cam_exposure_val", cv2.CAP_PROP_EXPOSURE), ("cam_gain", cv2.CAP_PROP_GAIN),
+                              ("cam_brightness", cv2.CAP_PROP_BRIGHTNESS), ("cam_contrast", cv2.CAP_PROP_CONTRAST),
+                              ("cam_saturation", cv2.CAP_PROP_SATURATION), ("cam_focus", cv2.CAP_PROP_FOCUS),
+                              ("cam_wb_temp", cv2.CAP_PROP_WB_TEMPERATURE)):
+                if c[key] != NOCAM:
+                    cap.set(prop, c[key])
+            if cap.isOpened() and cap.read()[0]:
+                break
+            cap.release()
+            cap = None
+            time.sleep(0.5)
+        if cap is None:
+            raise RuntimeError(
+                f"Cannot open camera {index} (backend {c['cam_backend']}, {c['cam_retries']} tries). Check that it is "
+                f"connected, not in use by another app, and that the camera number is right.")
+        self.cap = cap
+        self.rgb = None
+        self._tl = 0.0
+
+    def src_read(self):
+        c = cfg()
+        hz = c["max_trial_hz"]
+        if hz > 0:
+            wait = self._tl + 1.0 / hz - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            self._tl = time.perf_counter()
+        for _ in range(int(c["frame_decimate"]) - 1):
+            self.cap.grab()
+        ok, bgr = self.cap.read()
+        if not ok:
+            return None
+        mi = c["mirror"]
+        if mi != "none":
+            bgr = cv2.flip(bgr, {"horizontal": 1, "vertical": 0, "both": -1}[mi])
+        if c["rotate"] != "0":
+            bgr = cv2.rotate(bgr, {"90": cv2.ROTATE_90_CLOCKWISE, "180": cv2.ROTATE_180,
+                                   "270": cv2.ROTATE_90_COUNTERCLOCKWISE}[c["rotate"]])
+        self.rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        if PACK:
+            PACK.last_full = self.rgb
+        gs = c["gray_source"]
+        if gs == "gray":
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if gs in ("red", "green", "blue"):
+            return np.ascontiguousarray(bgr[:, :, {"blue": 0, "green": 1, "red": 2}[gs]])
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        return np.ascontiguousarray(hsv[:, :, 2 if gs == "hsv-value" else 1])
+    rp.Source.__init__ = src_init
+    rp.Source.read = src_read
+
+    # ---- preview with colour/alpha, ROI box, grid, frame counter
+    def make_preview(rgb, mask, overlay):
+        c = cfg()
+        if PACK:
+            PACK.frame_no += 1
+        h, w = rgb.shape[:2]
+        pv = rgb[np.arange(rp.PH) * h // rp.PH][:, np.arange(rp.PW) * w // rp.PW].copy()
+        if c["preview_gray"]:
+            gy = (pv @ np.array([0.299, 0.587, 0.114])).astype(np.uint8)
+            pv = np.stack([gy] * 3, axis=-1)
+        if overlay and mask.any():
+            big = mask[np.arange(rp.PH) * rp.SH // rp.PH][:, np.arange(rp.PW) * rp.SW // rp.PW]
+            a = c["overlay_alpha"] / 100.0
+            col = np.array(PACK.ov_rgb if PACK else (255, 40, 40))
+            pv[big] = (pv[big] * (1 - a) + col * a).astype(np.uint8)
+        if c["show_grid"]:
+            for f in (1 / 3, 2 / 3):
+                pv[int(rp.PH * f), :] = (200, 200, 200)
+                pv[:, int(rp.PW * f)] = (200, 200, 200)
+        if c["show_roi"]:
+            x0, x1 = sorted((c["roi_x0"], c["roi_x1"]))
+            y0, y1 = sorted((c["roi_y0"], c["roi_y1"]))
+            X0, X1 = int(rp.PW * x0 / 100), min(rp.PW - 1, int(rp.PW * x1 / 100))
+            Y0, Y1 = int(rp.PH * y0 / 100), min(rp.PH - 1, int(rp.PH * y1 / 100))
+            yel = (255, 213, 74)
+            pv[Y0, X0:X1 + 1] = yel
+            pv[Y1, X0:X1 + 1] = yel
+            pv[Y0:Y1 + 1, X0] = yel
+            pv[Y0:Y1 + 1, X1] = yel
+        return pv
+    rp.make_preview = make_preview
+
+    # ---- Driver A with m witness rounds (sim thread only; analysis/BTC keep the original)
+    orig_mr = rp.miller_rabin_witness
+
+    def mr(a, n):
+        if orig_mr(a, n):
+            return True
+        m = cfg()["witness_rounds"]
+        if m > 1 and n > 4 and isinstance(threading.current_thread(), rp.SimThread):
+            for i in range(1, m):
+                ai = 2 + int.from_bytes(hashlib.sha256(f"{a}|{n}|{i}".encode()).digest(), "big") % (n - 3)
+                if orig_mr(ai, n):
+                    return True
+        return False
+    rp.miller_rabin_witness = mr
+
+
+# ------------------------------------------------------------------ the pack
+class Pack:
+    def __init__(self, app):
+        self.app, self.win = app, app.window
+        self.cfg = dict(DEFAULTS)
+        self.profiles, self.undo = {}, []
+        self.status, self.live = tk.StringVar(value=""), tk.StringVar(value="")
+        self.dlg, self.vars, self.rows = None, {}, {}
+        self._syncing, self._dirty, self._flush_job = False, set(), None
+        self._fh = None
+        self.last_S, self.last_m = {}, {}
+        self.t_start = self.last_motion = time.time()
+        self.last_codes = self._fa = 0
+        self.t_rot = self.t_stat = self.t_csv = self.t_save = self.t_anreset = self.t_hreset = time.time()
+        self.rot_i = 0
+        self.cal, self.cal_started_preview = None, False
+        self.base_title = self.win.title()
+        self.flash_until = self._last_alert = 0.0
+        self.scales = []
+        self.frame_no = 0
+        self.last_full = None
+        self.ov_rgb = (255, 40, 40)
+        self.draw_n = 0
+        self._snap_req, self._snap_t, self._snap_tp = None, 0.0, 0.0
+        self._streak, self._sf = 0, -2
+        self._cnt = {"hidden": 0, "search": 0, "factor": 0}
+        self._last = {"hidden": 0.0, "search": 0.0, "factor": 0.0}
+        self._win_ts = {t: deque() for t in self._cnt}
+        self.gstat = {t: dict(passed=0, blocked=0, hits=0) for t in self._cnt}
+        self._was_running = False
+        self.user_stop, self.last_circuit, self._auto_starting = False, True, False
+        self.restarts, self._restart_job = 0, None
+        self._inw_prev, self._sched_started = None, False
+        self._jit_prev = False
+        H = self.H = {}
+        a = app
+        for i, key in enumerate(("thr", "min_px", "k")):
+            H[key] = (lambda v, i=i, key=key: self._scale(i, key, v))
+        H.update({
+            "blur": self._h_blur, "overlay": self._h_overlay, "cam_index": lambda v: a.s_cam.set(v),
+            "y": self._h_y, "force": self._h_force,
+            "hidden_on": lambda v: (a.v_hidden_on.set(v), a.ctl.update(hidden_on=v)),
+            "hidden_range": lambda v: (a.v_hrange.set(str(v)), a._hidden_range_changed()),
+            "hidden_hz": lambda v: (a.v_hhz.set(f"{v:g}"), a._hidden_hz_changed()),
+            "search_on": lambda v: (a.v_search_on.set(v), a.ctl.update(search_on=v)),
+            "search_bits": lambda v: (a.v_sbits.set(str(v)), a._search_bits_changed()),
+            "fsearch_on": lambda v: (a.v_fs_on.set(v), a.ctl.update(fsearch_on=v)),
+            "factor_bits": lambda v: a.v_fbits.set(str(v)),
+            "factor_hl": lambda v: a.v_fhl.set(v),
+            "btc_period": lambda v: a.btc_period_var.set(str(v)),
+            "fps_cap": lambda v: setattr(rp, "FRAME_INTERVAL", max(1, int(1000 / v))),
+            "compact": lambda v: (a.v_compact.set(v), a._apply_compact()),
+            "log_file": lambda v: self._close_fh(), "log_path": lambda v: self._close_fh(),
+            "window_alpha": lambda v: self._try(lambda: self.win.attributes("-alpha", v / 100.0)),
+            "topmost": lambda v: self._try(lambda: self.win.attributes("-topmost", bool(v))),
+            "title_prefix": self._h_title,
+            "log_font": lambda v: a.log.config(font=("Consolas", v)),
+            "log_height": lambda v: a.log.config(height=v),
+            "analysis_font": lambda v: a.analysis.config(font=("Consolas", v)),
+            "verdict_font": lambda v: a.verdict.config(font=("Arial", v, "bold")),
+            "x_hist_len": lambda v: setattr(a, "x_hist", deque(a.x_hist, maxlen=v)),
+            "color_wire_on": lambda v: (self._color(v), setattr(rp, "W_ON", v), self._repaint()),
+            "color_wire_off": lambda v: (self._color(v), setattr(rp, "W_OFF", v), self._repaint()),
+            "color_box_off": lambda v: (self._color(v), setattr(rp, "OFF", v), self._repaint()),
+            "overlay_color": lambda v: setattr(self, "ov_rgb", self._color(v)),
+            "warmup": lambda v: setattr(rp, "WARMUP", int(v)),
+            "sched_start": self._h_hhmm, "sched_end": self._h_hhmm,
+        })
+        for key in ("vs", "v_be", "v_ih", "rc_b_ms", "tau_node_ms"):
+            H[key] = self._h_circuit
+
+    # ---------------------------------------------------------- small helpers
+    def _try(self, fn):
+        try:
+            fn()
+        except tk.TclError:
+            pass
+
+    def _color(self, v):
+        try:
+            return tuple(c >> 8 for c in self.win.winfo_rgb(v))
+        except tk.TclError:
+            raise ValueError("not a colour")
+
+    def _repaint(self):
+        pc = self.app._photo_cache
+        for key in [k for k in pc if isinstance(k, tuple) and k[0] in ("wire", "fill")]:
+            del pc[key]
+
+    def _h_hhmm(self, v):
+        try:
+            h, m = v.split(":")
+            if not (0 <= int(h) < 24 and 0 <= int(m) < 60):
+                raise ValueError
+        except ValueError:
+            raise ValueError("use HH:MM")
+
+    def _h_title(self, v):
+        self.base_title = (v + "  " if v else "") + self._orig_title
+
+    def _scale(self, i, key, v):
+        self.app.ctl[key] = int(v)
+        if i < len(self.scales):
+            self.scales[i].set(v)
+
+    def _h_blur(self, v):
+        if v > 0 and v % 2 == 0:
+            v += 1
+        self.cfg["blur"] = 0 if v < 3 else v
+
+    def _h_overlay(self, v):
+        self.app.v_ov.set(v)
+        self.app.ctl["overlay"] = v
+
+    def _h_y(self, v):
+        rp.parse_code(v)
+        self.app.e_y.delete(0, "end")
+        self.app.e_y.insert(0, v)
+        self.app._y_changed()
+
+    def _h_force(self, v):
+        self.app.v_force.set(v)
+        self.app.ctl["force"] = v
+        self.app._refresh_analysis()
+
+    def _h_circuit(self, _v):
+        c = self.cfg
+        rp.VS, rp.V_BE, rp.V_IH = c["vs"], c["v_be"], c["v_ih"]
+        rp.RC_B, rp.TAU_NODE = c["rc_b_ms"] / 1000.0, c["tau_node_ms"] / 1000.0
+        margin = c["vs"] - c["v_ih"] - c["v_be"]
+        rp.LOGIC_TIME = rp.RC_B * math.log(c["vs"] / margin) if margin > 0 else float("inf")
+        if margin <= 0:
+            self.status.set("warning: VS - V_BE <= V_IH, so Driver B can never reach logic HIGH")
+
+    def _find_scales(self):
+        out = []
+
+        def walk(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, ttk.Scale):
+                    out.append(ch)
+                walk(ch)
+        walk(self.app.root)
+        return out[:3]
+
+    def _running(self):
+        return str(self.app.b_stop["state"]) == "normal"
+
+    # ---------------------------------------------------------- install
+    def install(self):
+        a = self.app
+        self._orig_title = self.win.title()
+        self.scales = self._find_scales()
+        ttk.Button(a.ctl_row2, text="Settings (F8)", command=self.open_dialog).pack(side="left", padx=10)
+        orig_render, orig_show = a._render, a._show_miner
+        orig_log, orig_frame = a._log, a._frame_log
+        orig_start, orig_stop, orig_close = a.start, a.stop, a._close
+
+        def render(d):
+            orig_render(d)
+            c = self.cfg
+            self.draw_n += 1
+            S = d.get("stats") or {}
+            if S:
+                self.last_S = S
+            fa = S.get("false_acc", 0)
+            if fa > self._fa and c["alert_false_accept"]:
+                self.alert("false accept")
+            self._fa = fa
+            now = time.time()
+            if d["motion"]:
+                self.last_motion = now
+            if self.cal and self.cal.get("collect"):
+                self.cal["samples"].append(d["x"])
+            reason = None
+            if self._snap_req:
+                reason, self._snap_req = self._snap_req, None
+            elif d["motion"] and c["snap_x"] and d["x"] >= c["snap_x"]:
+                reason = "motion"
+            elif d["motion"] and c["snap_periodic_s"] and now - self._snap_tp >= c["snap_periodic_s"]:
+                reason = "periodic"
+            if reason:
+                self._snap(reason, d)
+        a._render = render
+
+        def show_miner(m):
+            orig_show(m)
+            self.last_m = m
+            n = m.get("timecodes_added", 0)
+            if n > self.last_codes:
+                if self.cfg["alert_beep"]:
+                    self.alert("time code")
+                if self.cfg["snap_on_code"]:
+                    self._snap_req = "code"
+            self.last_codes = n
+        a._show_miner = show_miner
+
+        def log(s):
+            if self.cfg["log_mode"] == "minimal" and not any(
+                    t in s for t in ("#", "ERROR", "FOUND", "GUESSED", "VERIFIED", "BTC")):
+                return
+            orig_log(s)
+            self._write_file(s)
+        a._log = log
+        a._frame_log = lambda d: orig_frame(d) if self.cfg["log_mode"] == "all" else None
+
+        def mk_draw(name, key):
+            orig = getattr(a, name)
+
+            def f():
+                if self.cfg[key] and self.draw_n % self.cfg["plot_every_n"] == 0:
+                    orig()
+            setattr(a, name, f)
+        mk_draw("_draw_traj", "draw_traj")
+        mk_draw("_draw_x", "draw_x")
+        mk_draw("_draw_strip", "draw_strip")
+
+        def start(circuit=True):
+            orig_start(circuit)
+            self.user_stop = False
+            self.last_circuit = circuit
+            if not self._auto_starting:
+                self.restarts = 0
+            self.t_start = self.last_motion = time.time()
+            self.last_S, self.last_m, self.last_codes, self._fa = {}, {}, 0, 0
+            self._streak, self._sf = 0, -2
+            ST.clear()
+        a.start = start
+
+        def stop():
+            self.user_stop = True
+            orig_stop()
+        a.stop = stop
+        a.b_start.config(command=lambda: a.start(True))
+        a.b_prev.config(command=lambda: a.start(False))
+        a.b_stop.config(command=lambda: a.stop())
+
+        def close():
+            if self.cfg["confirm_close"] and self._running() and not messagebox.askokcancel(
+                    "Close", "The circuit is running. Close anyway?"):
+                return
+            self.save_file(silent=True)
+            self._close_fh()
+            orig_close()
+        a._close = close
+        self.win.protocol("WM_DELETE_WINDOW", close)
+
+        self._wrap_source(a.hidden, "spot_check", "hidden", False)
+        self._wrap_source(a.search, "guess", "search", True)
+        self._wrap_source(a.fsearch, "guess", "factor", True)
+
+        for key, fn in (("<F5>", lambda e: a.start(True)), ("<F6>", lambda e: a.start(False)),
+                        ("<F7>", lambda e: a.stop()), ("<F8>", lambda e: self.open_dialog()),
+                        ("<F9>", lambda e: self.calibrate())):
+            self.win.bind_all(key, fn)
+        self.win.bind_all("<space>", self._space)
+
+        self.load_file(silent=True)
+        self.apply(dict(self.cfg), undo=False, force=True)
+        self.win.after(500, self._tick)
+        if self.cfg["autostart"] != "none":
+            self.win.after(int(self.cfg["autostart_delay_s"] * 1000), self._autostart)
+        if self.cfg["btc_auto_on_start"]:
+            self.win.after(1500, lambda: (a.btc_auto_var.set(True), a.btc_toggle_auto()))
+
+    def _autostart(self):
+        if not self._running():
+            self._auto_starting = True
+            self.app.start(self.cfg["autostart"] == "circuit")
+            self._auto_starting = False
+
+    def _space(self, e):
+        if e.widget.winfo_class() in ("TEntry", "TSpinbox", "Text", "TCombobox", "Entry", "Spinbox"):
+            return
+        self.app.stop() if self._running() else self.app.start(True)
+
+    # ---------------------------------------------------------- source gate (sim thread)
+    def _gate(self, tag):
+        c = self.cfg
+        fn = self.frame_no
+        if self._sf != fn:
+            self._streak = self._streak + 1 if fn == self._sf + 1 else 1
+            self._sf = fn
+        if not c["gate_" + tag if tag != "hidden" else "gate_hidden"]:
+            return True
+        if self._streak + 1 < c["gate_min_evens"]:
+            return False
+        if c["gate_prob_pct"] < 100 and random.random() * 100 >= c["gate_prob_pct"]:
+            return False
+        now = time.perf_counter()
+        if c["gate_min_gap_ms"] and now - self._last[tag] < c["gate_min_gap_ms"] / 1000.0:
+            return False
+        if c["gate_max_per_sec"]:
+            q = self._win_ts[tag]
+            while q and now - q[0] > 1.0:
+                q.popleft()
+            if len(q) >= c["gate_max_per_sec"]:
+                return False
+        self._cnt[tag] += 1
+        if c["gate_every_n"] > 1 and self._cnt[tag] % c["gate_every_n"]:
+            return False
+        self._last[tag] = now
+        self._win_ts[tag].append(now)
+        return True
+
+    def _wrap_source(self, obj, name, tag, multi):
+        orig = getattr(obj, name)
+        reward_key = {"hidden": "reward_hidden", "search": "reward_search", "factor": "reward_factor"}[tag]
+
+        def f():
+            if not self._gate(tag):
+                self.gstat[tag]["blocked"] += 1
+                return False
+            self.gstat[tag]["passed"] += 1
+            n = self.cfg["multi_query"] if multi else 1
+            hit = False
+            for _ in range(n):
+                if orig():
+                    hit = True
+                    break
+            if hit:
+                self.gstat[tag]["hits"] += 1
+                extra = self.cfg[reward_key] - 1
+                if extra > 0:
+                    self.app.ctl["timecode_pending"] = self.app.ctl.get("timecode_pending", 0) + extra
+            return hit
+        setattr(obj, name, f)
+
+    # ---------------------------------------------------------- apply / undo
+    def apply(self, new, undo=True, force=False, from_ui=False):
+        changed = {k: v for k, v in new.items() if k in DEFAULTS and (force or self.cfg.get(k) != v)}
+        if not changed:
+            return
+        if undo:
+            self.undo.append(dict(self.cfg))
+            del self.undo[:-30]
+        mod = []
+        for k, v in changed.items():
+            old = self.cfg.get(k)
+            self.cfg[k] = v
+            try:
+                h = self.H.get(k)
+                if h:
+                    h(v)
+                if self.cfg[k] != v:
+                    mod.append(k)
+                if k in RESET_AN_KEYS and self.cfg["reset_an_on_change"] and not force:
+                    self.app.ctl["reset_an"] = True
+            except ValueError as e:
+                self.cfg[k] = old
+                self.status.set(f"{k}: rejected ({e})")
+            except Exception as e:
+                self.status.set(f"{k}: {type(e).__name__}: {e}")
+        self.sync(mod if from_ui else None)
+
+    def revert(self):
+        if not self.undo:
+            self.status.set("nothing to revert")
+            return
+        self.apply(self.undo.pop(), undo=False)
+        self.status.set(f"reverted ({len(self.undo)} more steps)")
+
+    def defaults(self):
+        self.apply(dict(DEFAULTS))
+        self.status.set("defaults restored (undo with Revert)")
+
+    def modified(self):
+        return [k for k in DEFAULTS if self.cfg[k] != DEFAULTS[k]]
+
+    def show_modified(self):
+        m = self.modified()
+        messagebox.showinfo("Modified settings", "\n".join(f"{k} = {self.cfg[k]}   (default {DEFAULTS[k]})"
+                                                           for k in m) or "Everything is at its default.",
+                            parent=self.dlg)
+
+    # ---------------------------------------------------------- persistence
+    def save_file(self, silent=False, path=None):
+        path = path or SETTINGS_FILE
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict(cfg=self.cfg, profiles=self.profiles), f, indent=2)
+            if not silent:
+                self.status.set(f"saved {path}")
+        except OSError as e:
+            if not silent:
+                messagebox.showerror("Settings", str(e))
+
+    def load_file(self, silent=False, path=None):
+        path = path or SETTINGS_FILE
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return
+        for k, v in data.get("cfg", {}).items():
+            if k in DEFAULTS and (isinstance(v, type(DEFAULTS[k])) or
+                                  (isinstance(DEFAULTS[k], float) and isinstance(v, int))) \
+                    and not (isinstance(DEFAULTS[k], int) and isinstance(v, bool) != isinstance(DEFAULTS[k], bool)):
+                self.cfg[k] = v
+        self.profiles.update(data.get("profiles", {}))
+        if not silent:
+            self.apply(dict(self.cfg), force=True)
+            self.status.set(f"loaded {path}")
+
+    def export_snapshot(self):
+        path = filedialog.asksaveasfilename(title="Export snapshot", defaultextension=".json",
+                                            initialfile="rp_snapshot.json")
+        if not path:
+            return
+        data = dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), cfg=self.cfg, stats=self.last_S,
+                    codes=self.last_m, gate=self.gstat, x_history=list(self.app.x_hist))
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+            self.status.set(f"snapshot saved: {path}")
+        except OSError as e:
+            messagebox.showerror("Snapshot", str(e))
+
+    # ---------------------------------------------------------- log / csv / snapshots / alerts
+    def _write_file(self, s):
+        if not self.cfg["log_file"]:
+            return
+        try:
+            if self._fh is None:
+                self._fh = open(self.cfg["log_path"], "a", encoding="utf-8")
+            self._fh.write(time.strftime("%H:%M:%S ") + s + "\n")
+            self._fh.flush()
+        except OSError:
+            self.cfg["log_file"], self._fh = False, None
+            self.status.set("log file error: file logging turned off")
+
+    def _close_fh(self):
+        if self._fh:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+        self._fh = None
+
+    def _write_csv(self):
+        S, m = self.last_S, self.last_m
+        path = self.cfg["csv_path"]
+        try:
+            new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "frames", "motion", "in_L", "acc_in_L", "false_acc", "timecodes",
+                                "hidden", "search", "factor", "pending", "k", "thr", "min_px", "y"])
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), S.get("frames", 0), S.get("motion", 0),
+                            S.get("in_L", 0), S.get("acc_in_L", 0), S.get("false_acc", 0),
+                            S.get("timecodes_added", 0), S.get("hidden_timecodes", 0),
+                            S.get("search_timecodes", 0), S.get("factor_timecodes", 0),
+                            m.get("timecode_pending", 0), self.cfg["k"], self.cfg["thr"],
+                            self.cfg["min_px"], self.cfg["y"]])
+        except OSError as e:
+            self.cfg["csv_on"] = False
+            self.status.set(f"CSV error, recording off: {e}")
+
+    def _snap(self, reason, d):
+        c, now = self.cfg, time.time()
+        if reason != "manual" and now - self._snap_t < c["snap_min_gap_s"]:
+            return
+        try:
+            os.makedirs(c["snap_dir"], exist_ok=True)
+            img = self.last_full if (c["snap_full"] and self.last_full is not None) else d["preview"]
+            ext = "jpg" if c["snap_format"] == "jpg" else "png"
+            name = f"{time.strftime('%Y%m%d_%H%M%S')}_{int(now * 1000) % 1000:03d}_x{d['x']}_{reason}.{ext}"
+            rp.cv2.imwrite(os.path.join(c["snap_dir"], name), rp.cv2.cvtColor(img, rp.cv2.COLOR_RGB2BGR))
+            self._snap_t = self._snap_tp = now
+            if c["snap_max"] > 0:
+                files = sorted(f for f in os.listdir(c["snap_dir"]) if f.lower().endswith((".png", ".jpg")))
+                for f in files[:max(0, len(files) - c["snap_max"])]:
+                    os.remove(os.path.join(c["snap_dir"], f))
+        except Exception as e:
+            self.status.set(f"snapshot failed: {e}")
+
+    def snap_now(self):
+        self._snap_req = "manual"
+        if not self._running():
+            self.status.set("start the camera first; a snapshot is taken on the next frame")
+
+    def alert(self, why):
+        now = time.time()
+        if now - self._last_alert < self.cfg["alert_cooldown_s"]:
+            return
+        self._last_alert = now
+        for i in range(int(self.cfg["beep_count"])):
+            self.win.after(i * 150, lambda: self._try(self.win.bell))
+        self.flash_until = now + self.cfg["flash_secs"]
+        self.flash_why = why
+
+    def _summary(self):
+        S = self.last_S
+        return (f"# session summary: {time.time() - self.t_start:.0f}s, frames {S.get('frames', 0)}, "
+                f"motion {S.get('motion', 0)}, in L {S.get('in_L', 0)} (accepted {S.get('acc_in_L', 0)}), "
+                f"false accepts {S.get('false_acc', 0)}, time codes {S.get('timecodes_added', 0)} "
+                f"(hidden {S.get('hidden_timecodes', 0)}, search {S.get('search_timecodes', 0)}, "
+                f"factor {S.get('factor_timecodes', 0)})")
+
+    # ---------------------------------------------------------- periodic automation
+    def _tick(self):
+        try:
+            self._automation()
+        except Exception as e:
+            self.status.set(f"automation error: {type(e).__name__}: {e}")
+        finally:
+            self.win.after(500, self._tick)
+
+    def _in_window(self):
+        try:
+            mins = lambda s: int(s.split(":")[0]) * 60 + int(s.split(":")[1])
+            s, e = mins(self.cfg["sched_start"]), mins(self.cfg["sched_end"])
+        except (ValueError, IndexError):
+            return None
+        t = time.localtime()
+        n = t.tm_hour * 60 + t.tm_min
+        return (s <= n < e) if s < e else (n >= s or n < e)
+
+    def _automation(self):
+        a, c, now = self.app, self.cfg, time.time()
+        running = self._running()
+        if self._was_running and not running:
+            if c["summary_on_stop"] and self.last_S:
+                a._log(self._summary())
+            if not self.user_stop:
+                if c["alert_camera_lost"]:
+                    self.alert("stopped unexpectedly")
+                if c["auto_restart"] and self.restarts < c["restart_max"] and not self.cal:
+                    self.restarts += 1
+                    a._log(f"# auto-restart {self.restarts}/{c['restart_max']} in {c['restart_delay_s']} s")
+                    self.win.after(int(c["restart_delay_s"] * 1000), self._do_restart)
+        self._was_running = running
+
+        if c["sched_on"]:
+            inw = self._in_window()
+            if inw is not None:
+                if inw and not self._inw_prev and not running:
+                    self._sched_started = True
+                    self._auto_starting = True
+                    a.start(True)
+                    self._auto_starting = False
+                    a._log("# schedule: started")
+                elif not inw and self._inw_prev and running and self._sched_started:
+                    a.stop()
+                    self._sched_started = False
+                    a._log("# schedule: stopped")
+            self._inw_prev = inw
+
+        title = self.base_title
+        if running:
+            S, m = self.last_S, self.last_m
+            reason = None
+            if c["stop_secs"] and now - self.t_start >= c["stop_secs"]:
+                reason = f"{c['stop_secs']} s elapsed"
+            elif c["stop_frames"] and S.get("frames", 0) >= c["stop_frames"]:
+                reason = f"{c['stop_frames']} frames processed"
+            elif c["stop_codes"] and m.get("timecodes_added", 0) >= c["stop_codes"]:
+                reason = f"{c['stop_codes']} time codes earned"
+            if reason and not self.cal:
+                a.stop()
+                a._log(f"# auto-stop: {reason}")
+                self.status.set(f"auto-stopped: {reason}")
+            if c["y_rotate"] and now - self.t_rot >= c["y_rotate_s"] and not self.cal:
+                good = []
+                for t in (s.strip() for s in c["y_rotate_list"].split(",")):
+                    try:
+                        if t:
+                            rp.parse_code(t)
+                            good.append(t)
+                    except ValueError:
+                        pass
+                if good:
+                    self.rot_i = (self.rot_i + 1) % len(good)
+                    self.apply({"y": good[self.rot_i]}, undo=False)
+                    a._log(f"# Y rotated to {good[self.rot_i]}")
+                self.t_rot = now
+            idle = now - self.last_motion
+            if c["idle_warn_s"] and idle >= c["idle_warn_s"] and not self.cal:
+                title += "   [NO MOTION]"
+            if c["recal_idle_min"] and idle >= c["recal_idle_min"] * 60 and not self.cal:
+                self.last_motion = now
+                a._log("# idle: running noise-floor recalibration")
+                self.calibrate()
+            if c["stats_log_s"] and now - self.t_stat >= c["stats_log_s"]:
+                self.t_stat = now
+                a._log(self._summary().replace("session summary", "stats"))
+            if c["csv_on"] and now - self.t_csv >= c["csv_period_s"]:
+                self.t_csv = now
+                self._write_csv()
+            if c["analysis_reset_min"] and now - self.t_anreset >= c["analysis_reset_min"] * 60:
+                self.t_anreset = now
+                a.ctl["reset_an"] = True
+            if c["pending_cap"] and a.ctl.get("timecode_pending", 0) > c["pending_cap"]:
+                a.ctl["timecode_pending"] = c["pending_cap"]
+        if c["autosave_s"] and now - self.t_save >= c["autosave_s"]:
+            self.t_save = now
+            self.save_file(silent=True)
+        self._hidden_clock(now)
+        if self.cal:
+            title += f"   [CALIBRATING: {self.status.get()}]"
+        if now < self.flash_until:
+            title += f"   *** {getattr(self, 'flash_why', '').upper()} ***"
+        if self.win.title() != title:
+            self.win.title(title)
+        if self.dlg is not None and self.dlg.winfo_exists():
+            g = self.gstat
+            self.live.set(
+                f"even run {self._streak + 1 if self._streak else 0}   pending bins {a.ctl.get('timecode_pending', 0)}   "
+                f"gate passed/blocked  hidden {g['hidden']['passed']}/{g['hidden']['blocked']}  "
+                f"search {g['search']['passed']}/{g['search']['blocked']}  "
+                f"factor {g['factor']['passed']}/{g['factor']['blocked']}   "
+                f"modified {len(self.modified())}")
+
+    def _do_restart(self):
+        if not self._running():
+            self._auto_starting = True
+            self.app.start(self.last_circuit)
+            self._auto_starting = False
+
+    def _hidden_clock(self, now):
+        c, h = self.cfg, self.app.hidden
+        if c["hidden_wander"]:
+            lo, hi = sorted((c["hidden_wander_min"], c["hidden_wander_max"]))
+            h.set_hz(random.uniform(lo, hi))
+            self._jit_prev = True
+        elif c["hidden_jitter_pct"] > 0:
+            j = c["hidden_jitter_pct"] / 100.0
+            h.set_hz(c["hidden_hz"] * (1 + random.uniform(-j, j)))
+            self._jit_prev = True
+        elif self._jit_prev:
+            h.set_hz(c["hidden_hz"])
+            self._jit_prev = False
+        if c["hidden_autoreset_min"] and now - self.t_hreset >= c["hidden_autoreset_min"] * 60:
+            self.t_hreset = now
+            self.app._hidden_new_secret()
+
+    # ---------------------------------------------------------- calibration
+    def calibrate(self):
+        a = self.app
+        if self.cal:
+            self._cal_end("aborted", restore=True)
+            return
+        self.cal_started_preview = not self._running()
+        if self.cal_started_preview:
+            a.start(False)
+        delay = 2.5 if self.cal_started_preview else 0.8
+        self.cal = dict(thrs=[6, 10, 14, 18, 24, 32, 44], i=-1, phase="warm", t=time.time() + delay,
+                        samples=[], res=[], collect=False)
+        self.apply({"min_px": 5})
+        self.status.set("keep the scene STILL ...")
+        self.win.after(100, self._cal_tick)
+
+    def _cal_tick(self):
+        cal = self.cal
+        if not cal:
+            return
+        now = time.time()
+        if now >= cal["t"]:
+            ph = cal["phase"]
+            if ph in ("warm", "next"):
+                cal["i"] += 1
+                if cal["i"] >= len(cal["thrs"]):
+                    self._cal_finish()
+                    return
+                self.apply({"thr": cal["thrs"][cal["i"]]}, undo=False)
+                cal["phase"], cal["t"], cal["samples"] = "settle", now + 0.6, []
+            elif ph == "settle":
+                cal["phase"], cal["t"], cal["collect"] = "collect", now + 2.0, True
+            elif ph == "collect":
+                cal["collect"] = False
+                s = sorted(cal["samples"])
+                if len(s) >= 15:
+                    cal["res"].append((cal["thrs"][cal["i"]], s[min(len(s) - 1, int(0.99 * len(s)))], len(s)))
+                cal["phase"], cal["t"] = "next", now
+            self.status.set(f"sweeping thr {cal['thrs'][max(0, cal['i'])]} ({cal['i'] + 1}/{len(cal['thrs'])})")
+        self.win.after(100, self._cal_tick)
+
+    def _cal_finish(self):
+        res = self.cal["res"]
+        if not res:
+            self._cal_end("failed: no frames received", restore=True)
+            return
+        ok = [r for r in res if r[1] <= 12]
+        thr, p99, _ = ok[0] if ok else res[-1]
+        min_px = max(10, min(800, int(p99 * 2 + 8)))
+        table = "  ".join(f"{t}:{p}" for t, p, _ in res)
+        self.apply({"thr": thr, "min_px": min_px}, undo=False)
+        warn = "  (scene was not still)" if p99 > 60 else ""
+        self._cal_end(f"done: pixel diff {thr}, min moving px {min_px}{warn}", restore=False)
+        self.app._log("# calibration p99 noise px per threshold -> " + table)
+
+    def _cal_end(self, msg, restore):
+        cal, self.cal = self.cal, None
+        if restore and cal:
+            self.revert()
+        if self.cal_started_preview and self._running():
+            self.app.stop()
+        self.cal_started_preview = False
+        self.status.set("calibration " + msg)
+        self.app._log("# calibration " + msg)
+
+    def suggest_k(self):
+        Y, E = self.app.ctl["y"], self.cfg["target_err_bits"]
+        if "1" not in Y:
+            self.status.set("Y has no open bins: no k works")
+            return
+        for kk in range(1, 31):
+            if rp.window_stats(Y, kk)[0] >= E:
+                self.apply({"k": kk})
+                self.status.set(f"k={kk}: worst window has >= {E} open bins, error <= 2^-{E} at p=1/2")
+                return
+        self.status.set(f"needs k > 30 for 2^-{E} with Y={Y}; use a denser Y or more witness rounds")
+
+    def grant(self, n):
+        self.app.ctl["timecode_pending"] = max(0, self.app.ctl.get("timecode_pending", 0) + n)
+        self.status.set(f"pending bins: {self.app.ctl['timecode_pending']}")
+
+    def reset_gate(self):
+        for t in self.gstat:
+            self.gstat[t] = dict(passed=0, blocked=0, hits=0)
+            self._cnt[t] = 0
+        self.status.set("gate statistics reset")
+
+    # ---------------------------------------------------------- dialog
+    def _scroll_tab(self, nb, name):
+        outer = ttk.Frame(nb)
+        nb.add(outer, text=name)
+        cv = tk.Canvas(outer, highlightthickness=0)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        cv.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(cv, padding=8)
+        inner.grid_columnconfigure(3, weight=1)
+        wid = cv.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfig(wid, width=e.width))
+
+        def wheel(e):
+            if e.widget.winfo_class() in ("TSpinbox", "TCombobox"):
+                return
+            cv.yview_scroll(-3 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 3, "units")
+
+        def bind(_e=None):
+            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                cv.bind_all(ev, wheel)
+
+        def unbind(_e=None):
+            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                cv.unbind_all(ev)
+        for w in (cv, inner):
+            w.bind("<Enter>", bind)
+            w.bind("<Leave>", unbind)
+        return inner
+
+    def open_dialog(self):
+        if self.dlg is not None and self.dlg.winfo_exists():
+            self.dlg.lift()
+            return
+        w = tk.Toplevel(self.win)
+        w.title("Settings")
+        w.geometry("1020x700")
+        self.dlg = w
+        top = ttk.Frame(w)
+        top.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Label(top, text="Search settings:").pack(side="left")
+        self.v_search = tk.StringVar()
+        ttk.Entry(top, textvariable=self.v_search, width=34).pack(side="left", padx=6)
+        ttk.Label(top, text=f"{len(SPEC)} settings   (red = changed from default)", foreground="#777").pack(side="left")
+        self.v_search.trace_add("write", lambda *_: self._filter())
+        nb = ttk.Notebook(w)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        self.nb = nb
+        tabs, nrow = {}, {}
+        for name in TABS:
+            tabs[name] = self._scroll_tab(nb, name)
+        self.vars, self.rows = {}, {}
+        for tab, key, label, kind, extra, commit, help_ in SPEC:
+            f = tabs[tab]
+            r = nrow[tab] = nrow.get(tab, -1) + 1
+            lab = ttk.Label(f, text=label)
+            lab.grid(row=r, column=0, sticky="w", pady=2, padx=(0, 10))
+            if kind == "bool":
+                var = tk.BooleanVar()
+                wd = ttk.Checkbutton(f, variable=var)
+            elif kind in ("int", "float"):
+                var = tk.StringVar()
+                wd = ttk.Spinbox(f, from_=extra[0], to=extra[1], increment=extra[2], width=12, textvariable=var)
+            elif kind == "choice":
+                var = tk.StringVar()
+                wd = ttk.Combobox(f, values=extra, textvariable=var, width=16, state="readonly")
+            else:
+                var = tk.StringVar()
+                wd = ttk.Entry(f, width=36, textvariable=var)
+            wd.grid(row=r, column=1, sticky="w")
+            rb = ttk.Button(f, text="\u21ba", width=2, command=lambda k=key: self._reset_one(k))
+            rb.grid(row=r, column=2, padx=4)
+            hl = ttk.Label(f, text=help_, foreground="#777", wraplength=420)
+            hl.grid(row=r, column=3, sticky="w", padx=6)
+            self.vars[key] = var
+            self.rows[key] = dict(widgets=(lab, wd, rb, hl), lab=lab, text=f"{label} {key} {help_} {tab}".lower())
+            var.trace_add("write", lambda *_a, k=key: self._changed(k))
+            if kind == "choice":
+                wd.bind("<<ComboboxSelected>>", lambda e, k=key: self._commit(k), add="+")
+            if key in COMMIT:
+                for ev in ("<Return>", "<FocusOut>", "<<Increment>>", "<<Decrement>>"):
+                    wd.bind(ev, lambda e, k=key: self.win.after_idle(lambda: self._commit(k)), add="+")
+
+        tf = tabs["Time code"]
+        r = nrow["Time code"] + 1
+        ttk.Label(tf, text="Preset").grid(row=r, column=0, sticky="w", pady=(12, 3))
+        cb = ttk.Combobox(tf, values=Y_PRESETS, width=16, state="readonly")
+        cb.grid(row=r, column=1, sticky="w", pady=(12, 3))
+        cb.bind("<<ComboboxSelected>>", lambda e: self.apply({"y": cb.get()}))
+        ttk.Button(tf, text="Suggest k for target error", command=self.suggest_k).grid(
+            row=r + 1, column=0, columnspan=2, sticky="w", pady=6)
+
+        xf = tabs["Tools"]
+        xf.grid_columnconfigure(1, weight=1)
+        ttk.Label(xf, text="Profile").grid(row=0, column=0, sticky="w", pady=3)
+        self.cb_prof = ttk.Combobox(xf, width=36, state="readonly")
+        self.cb_prof.grid(row=0, column=1, sticky="w")
+        self._refresh_profiles()
+        pb = ttk.Frame(xf)
+        pb.grid(row=1, column=0, columnspan=4, sticky="w", pady=6)
+        for text, cmd in (("Apply profile", self._apply_profile), ("Save current as ...", self._save_profile),
+                          ("Delete", self._delete_profile), ("Show modified", self.show_modified)):
+            ttk.Button(pb, text=text, command=cmd).pack(side="left", padx=2)
+        ttk.Label(xf, text="A profile only changes the settings it lists. Every change can be undone with Revert.",
+                  foreground="#777").grid(row=2, column=0, columnspan=4, sticky="w")
+        ttk.Separator(xf).grid(row=3, column=0, columnspan=4, sticky="ew", pady=10)
+        tb = ttk.Frame(xf)
+        tb.grid(row=4, column=0, columnspan=4, sticky="w")
+        tools = (("Calibrate noise floor (F9)", self.calibrate), ("Snapshot now", self.snap_now),
+                 ("Grant 1 bin", lambda: self.grant(1)), ("Grant 10 bins", lambda: self.grant(10)),
+                 ("Clear pending bins", lambda: self.grant(-10 ** 9)),
+                 ("Reset analysis counters", lambda: self.app.ctl.update(reset_an=True)),
+                 ("Reset gate stats", self.reset_gate), ("New hidden secret", self.app._hidden_new_secret))
+        for i, (text, cmd) in enumerate(tools):
+            ttk.Button(tb, text=text, command=cmd).grid(row=i // 3, column=i % 3, padx=3, pady=3, sticky="w")
+
+        bar = ttk.Frame(w)
+        bar.pack(fill="x", padx=6, pady=(0, 4))
+        for text, cmd in (("Apply commit-fields", self._flush_all), ("Revert", self.revert),
+                          ("Defaults", self.defaults), ("Save", lambda: self.save_file()),
+                          ("Load...", self._load_dialog), ("Export snapshot", self.export_snapshot)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
+        ttk.Label(w, textvariable=self.live, font=("Consolas", 8), foreground="#555").pack(fill="x", padx=8)
+        ttk.Label(w, textvariable=self.status, foreground="#245").pack(fill="x", padx=8, pady=(0, 6))
+        w.protocol("WM_DELETE_WINDOW", self._close_dlg)
+        self.sync()
+
+    def _filter(self):
+        q = self.v_search.get().strip().lower()
+        first = None
+        for key, row in self.rows.items():
+            show = (not q) or all(t in row["text"] for t in q.split())
+            for wd in row["widgets"]:
+                (wd.grid if show else wd.grid_remove)()
+            if show and first is None:
+                first = key
+        if q and first:
+            tab = next(s[0] for s in SPEC if s[1] == first)
+            self.nb.select(TABS.index(tab))
+
+    def _close_dlg(self):
+        if self.dlg is not None:
+            self.dlg.destroy()
+        self.dlg = None
+
+    def sync(self, keys=None):
+        if self.dlg is None or not self.dlg.winfo_exists():
+            return
+        self._syncing = True
+        try:
+            for key in (keys if keys is not None else self.vars):
+                var, v = self.vars[key], self.cfg[key]
+                kind = KINDS[key][0]
+                var.set(bool(v) if kind == "bool" else (f"{v:g}" if kind == "float" else str(v)))
+            for key, row in self.rows.items():
+                row["lab"].configure(foreground="#c0392b" if self.cfg[key] != DEFAULTS[key] else "")
+        finally:
+            self._syncing = False
+
+    def _reset_one(self, key):
+        self.apply({key: DEFAULTS[key]})
+        self.sync([key])
+
+    def _read(self, key):
+        kind, extra = KINDS[key]
+        try:
+            return parse_val(kind, self.vars[key].get(), extra)
+        except (ValueError, tk.TclError):
+            return None
+
+    def _changed(self, key):
+        if self._syncing or key in COMMIT:
+            return
+        self._dirty.add(key)
+        if self._flush_job:
+            self.win.after_cancel(self._flush_job)
+        self._flush_job = self.win.after(350, self._flush_dirty)
+
+    def _flush_dirty(self):
+        self._flush_job = None
+        new = {k: self._read(k) for k in list(self._dirty)}
+        self._dirty.clear()
+        self.apply({k: v for k, v in new.items() if v is not None}, from_ui=True)
+
+    def _commit(self, key):
+        v = self._read(key)
+        if v is not None and not self._syncing:
+            self.apply({key: v}, from_ui=True)
+
+    def _flush_all(self):
+        new = {k: self._read(k) for k in COMMIT}
+        self.apply({k: v for k, v in new.items() if v is not None}, from_ui=True)
+
+    # ---------------------------------------------------------- profiles
+    def _all_profiles(self):
+        d = dict(BUILTIN_PROFILES)
+        d.update(self.profiles)
+        return d
+
+    def _refresh_profiles(self):
+        names = list(self._all_profiles())
+        self.cb_prof["values"] = names
+        if names and not self.cb_prof.get():
+            self.cb_prof.set(names[0])
+
+    def _apply_profile(self):
+        p = self._all_profiles().get(self.cb_prof.get())
+        if p:
+            self.apply(dict(p))
+            self.status.set(f"profile '{self.cb_prof.get()}' applied ({len(p)} settings)")
+
+    def _save_profile(self):
+        name = simpledialog.askstring("Profile", "Name for this profile:", parent=self.dlg)
+        if name:
+            self.profiles[name.strip()] = dict(self.cfg)
+            self._refresh_profiles()
+            self.cb_prof.set(name.strip())
+            self.save_file(silent=True)
+            self.status.set(f"profile '{name}' saved")
+
+    def _delete_profile(self):
+        n = self.cb_prof.get()
+        if n in self.profiles:
+            del self.profiles[n]
+            self.cb_prof.set("")
+            self._refresh_profiles()
+            self.save_file(silent=True)
+        else:
+            self.status.set("built-in profiles cannot be deleted")
+
+    def _load_dialog(self):
+        p = filedialog.askopenfilename(title="Load settings", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if p:
+            self.load_file(path=p)
+
+
+def main():
+    global PACK
     mp.freeze_support()
+    _install_core_patches()
     root = tk.Tk()
-    app = App(root)
+    app = rp.App(root)
+    PACK = Pack(app)
+    PACK.install()
     root.update_idletasks()
-    fit_window(root, app.root.winfo_reqwidth() + 24, app.root.winfo_reqheight() + 8)
+    rp.fit_window(root, app.root.winfo_reqwidth() + 24, app.root.winfo_reqheight() + 8)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
